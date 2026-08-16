@@ -13,53 +13,76 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
+    env:
+      WORKSPACE: /home/runner/dao-workspace
+      LOGDIR: /home/runner/dao-logs
+      VNCDIR: /home/runner/.vnc
+
     steps:
 
-      # =====================================================
-      # Basic setup
-      # =====================================================
+      # ==========================================
+      # Checkout
+      # ==========================================
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare workspace
+      # ==========================================
+      # Prepare directories
+      # ==========================================
+
+      - name: Prepare directories
         run: |
-          mkdir -p "$HOME/dao-workspace"
-          mkdir -p "$HOME/dao-logs"
+          mkdir -p "$WORKSPACE"
+          mkdir -p "$LOGDIR"
+          mkdir -p "$VNCDIR"
 
-      # =====================================================
-      # Restore workspace from previous run
-      # =====================================================
+          echo "Workspace: $WORKSPACE"
+          echo "Logs:      $LOGDIR"
+          echo "VNC:       $VNCDIR"
 
-      - name: Find previous workspace artifact
+      # ==========================================
+      # Find previous workspace
+      # ==========================================
+
+      - name: Find previous workspace
         id: previous
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Searching for previous workspace..."
 
           ARTIFACT_ID=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=dao-workspace&per_page=20" \
-            --jq '.artifacts
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=dao-workspace&per_page=100" \
+            --jq '
+              .artifacts
               | map(select(.expired == false))
               | sort_by(.created_at)
               | reverse
-              | .[0].id // empty')
+              | .[0].id // empty
+            ')
 
           if [ -n "$ARTIFACT_ID" ]; then
-            echo "Found artifact: $ARTIFACT_ID"
+            echo "Previous workspace found:"
+            echo "$ARTIFACT_ID"
+
             echo "artifact_id=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
           else
             echo "No previous workspace found."
+
             echo "artifact_id=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Restore previous workspace
+      # ==========================================
+      # Restore previous workspace
+      # ==========================================
+
+      - name: Restore workspace
         if: steps.previous.outputs.artifact_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+
           echo "Downloading previous workspace..."
 
           gh api \
@@ -67,17 +90,23 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ steps.previous.outputs.artifact_id }}/zip" \
             > /tmp/dao-workspace.zip
 
-          unzip -o /tmp/dao-workspace.zip \
-            -d "$HOME/dao-workspace"
+          mkdir -p "$WORKSPACE"
+
+          unzip -o \
+            /tmp/dao-workspace.zip \
+            -d "$WORKSPACE"
 
           echo "Workspace restored."
 
-      # =====================================================
-      # Install desktop
-      # =====================================================
+          find "$WORKSPACE" -maxdepth 2 -type f | head -50 || true
 
-      - name: Install desktop environment
+      # ==========================================
+      # Install packages
+      # ==========================================
+
+      - name: Install desktop
         run: |
+
           sudo apt-get update
 
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -96,13 +125,14 @@ jobs:
             unzip \
             jq
 
-      # =====================================================
-      # Install AnyDesk
-      # =====================================================
+      # ==========================================
+      # AnyDesk
+      # ==========================================
 
       - name: Install AnyDesk
         continue-on-error: true
         run: |
+
           echo "Installing AnyDesk..."
 
           wget -q \
@@ -110,25 +140,48 @@ jobs:
             -O /tmp/anydesk.deb
 
           if [ -s /tmp/anydesk.deb ]; then
-            sudo apt-get install -y /tmp/anydesk.deb || true
+
+            sudo apt-get install -y \
+              /tmp/anydesk.deb || true
+
           fi
 
           if command -v anydesk >/dev/null 2>&1; then
-            echo "AnyDesk installed."
+            echo "AnyDesk installed successfully."
             anydesk --version || true
           else
-            echo "AnyDesk installation unavailable."
+            echo "AnyDesk is unavailable."
           fi
 
-      # =====================================================
-      # Configure VNC
-      # =====================================================
+      # ==========================================
+      # VNC password
+      # ==========================================
 
-      - name: Configure TigerVNC
+      - name: Configure VNC password
         run: |
-          mkdir -p "$HOME/.vnc"
 
-          cat > "$HOME/.vnc/xstartup" <<'EOF'
+          mkdir -p "$VNCDIR"
+
+          # Temporary password for VNC.
+          # Change this value if you want another password.
+          VNC_PASSWORD="DAO12345"
+
+          printf '%s\n' "$VNC_PASSWORD" \
+            | vncpasswd -f \
+            > "$VNCDIR/passwd"
+
+          chmod 600 "$VNCDIR/passwd"
+
+          echo "VNC password configured."
+
+      # ==========================================
+      # VNC startup
+      # ==========================================
+
+      - name: Configure VNC desktop
+        run: |
+
+          cat > "$VNCDIR/xstartup" <<'EOF'
           #!/bin/sh
 
           unset SESSION_MANAGER
@@ -138,16 +191,19 @@ jobs:
           export LANG=C.UTF-8
           export LC_ALL=C.UTF-8
 
-          # Start lightweight XFCE
+          cd /home/runner/dao-workspace
+
           startxfce4 &
 
-          sleep 8
+          sleep 10
 
-          # Only requested applications
+          # FileZilla
           filezilla &
+
+          # Geany
           geany &
 
-          # AnyDesk is optional
+          # AnyDesk if available
           if command -v anydesk >/dev/null 2>&1; then
               anydesk &
           fi
@@ -155,81 +211,102 @@ jobs:
           wait
           EOF
 
-          chmod +x "$HOME/.vnc/xstartup"
+          chmod +x "$VNCDIR/xstartup"
 
-      # =====================================================
+      # ==========================================
       # Start VNC
-      # =====================================================
+      # ==========================================
 
       - name: Start VNC
         run: |
+
           vncserver :1 \
             -geometry 1280x720 \
             -depth 24 \
-            -localhost no
+            -localhost no \
+            -rfbauth "$VNCDIR/passwd"
 
-          sleep 5
+          sleep 8
 
+          echo "VNC status:"
           vncserver -list
 
-      # =====================================================
+          echo "Testing VNC..."
+
+          if ! pgrep -f "Xtigervnc.*:1" >/dev/null; then
+            echo "VNC failed to start."
+            cat "$VNCDIR"/*.log 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "VNC started successfully."
+
+      # ==========================================
       # Start noVNC
-      # =====================================================
+      # ==========================================
 
       - name: Start noVNC
         run: |
+
           nohup websockify \
             --web=/usr/share/novnc/ \
             8080 \
             127.0.0.1:5901 \
-            > "$HOME/dao-logs/novnc.log" 2>&1 &
+            > "$LOGDIR/novnc.log" 2>&1 &
 
-          echo $! > "$HOME/dao-logs/novnc.pid"
+          echo $! > "$LOGDIR/novnc.pid"
 
           sleep 5
 
           if ! pgrep -f "websockify.*8080" >/dev/null; then
             echo "noVNC failed."
-            cat "$HOME/dao-logs/novnc.log"
+
+            cat "$LOGDIR/novnc.log" || true
+
             exit 1
           fi
 
-          echo "noVNC is running."
+          echo "noVNC started."
 
-      # =====================================================
-      # Cloudflare Quick Tunnel
-      # =====================================================
+      # ==========================================
+      # Install Cloudflare Tunnel
+      # ==========================================
 
       - name: Install cloudflared
         run: |
-          echo "Installing cloudflared..."
 
           sudo wget -q \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -O /usr/local/bin/cloudflared
 
-          sudo chmod +x /usr/local/bin/cloudflared
+          sudo chmod +x \
+            /usr/local/bin/cloudflared
 
           cloudflared --version
 
-      - name: Start public tunnel
+      # ==========================================
+      # Start Cloudflare Tunnel
+      # ==========================================
+
+      - name: Start public desktop
         run: |
-          echo "Starting Cloudflare tunnel..."
 
           nohup cloudflared tunnel \
             --no-autoupdate \
             --url http://127.0.0.1:8080 \
-            > "$HOME/dao-logs/cloudflared.log" 2>&1 &
+            > "$LOGDIR/cloudflared.log" 2>&1 &
 
-          echo $! > "$HOME/dao-logs/cloudflared.pid"
+          echo $! > "$LOGDIR/cloudflared.pid"
 
           echo "Waiting for public URL..."
 
-          for i in $(seq 1 30); do
+          URL=""
+
+          for i in $(seq 1 60); do
 
             URL=$(grep -oE \
               'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
-              "$HOME/dao-logs/cloudflared.log" \
+              "$LOGDIR/cloudflared.log" \
               | head -n 1 || true)
 
             if [ -n "$URL" ]; then
@@ -237,109 +314,92 @@ jobs:
             fi
 
             sleep 2
+
           done
 
-          if [ -z "${URL:-}" ]; then
-            echo "Could not obtain Cloudflare URL."
-            cat "$HOME/dao-logs/cloudflared.log"
+          if [ -z "$URL" ]; then
+
+            echo "Cloudflare URL was not found."
+
+            cat "$LOGDIR/cloudflared.log"
+
             exit 1
+
           fi
 
+          DESKTOP_URL="${URL}/vnc.html?autoconnect=true&resize=remote"
+
           echo "===================================================="
-          echo "             DAO WEB DESKTOP ONLINE"
+          echo "           DAO WEB DESKTOP ONLINE"
           echo "===================================================="
           echo
-          echo "PUBLIC DESKTOP:"
+          echo "OPEN THIS URL:"
           echo
-          echo "${URL}/vnc.html?autoconnect=true&resize=remote"
+          echo "$DESKTOP_URL"
           echo
-          echo "===================================================="
+          echo "VNC PASSWORD:"
+          echo "DAO12345"
           echo
           echo "Applications:"
           echo "  FileZilla"
           echo "  Geany"
-          echo "  AnyDesk (if available)"
-          echo
-          echo "The URL is temporary and will stop when this"
-          echo "GitHub Actions runner stops."
+          echo "  AnyDesk"
           echo
           echo "===================================================="
 
-          echo "DESKTOP_URL=${URL}/vnc.html?autoconnect=true&resize=remote" >> "$GITHUB_ENV"
+          echo "$DESKTOP_URL" > "$LOGDIR/desktop-url.txt"
 
-      # =====================================================
-      # Save connection information
-      # =====================================================
-
-      - name: Save connection info
-        run: |
-          cat > "$HOME/dao-logs/desktop-info.txt" <<EOF
-          DAO WEB DESKTOP
-
-          URL:
-          ${DESKTOP_URL}
-
-          VNC:
-          :1
-
-          VNC PORT:
-          5901
-
-          noVNC:
-          8080
-
-          Applications:
-          FileZilla
-          Geany
-          AnyDesk
-          EOF
-
-          cat "$HOME/dao-logs/desktop-info.txt"
-
-      # =====================================================
-      # Keep desktop alive for 4 hours
-      # =====================================================
+      # ==========================================
+      # Keep alive
+      # ==========================================
 
       - name: Keep desktop alive
         run: |
-          echo "Desktop is running."
+
+          echo "Desktop is running for up to 4 hours."
 
           for MINUTE in $(seq 1 240); do
 
-            if ! pgrep -f "Xtigervnc" >/dev/null; then
-              echo "TigerVNC stopped unexpectedly."
+            if ! pgrep -f "Xtigervnc.*:1" >/dev/null; then
+
+              echo "VNC stopped unexpectedly."
+
               exit 1
+
             fi
 
             if ! pgrep -f "websockify.*8080" >/dev/null; then
+
               echo "noVNC stopped unexpectedly."
+
               exit 1
+
             fi
 
-            echo "[$(date '+%H:%M:%S')] Desktop active: ${MINUTE}/240 minutes"
+            echo "[$(date '+%H:%M:%S')] Running: $MINUTE/240 minutes"
 
             sleep 60
+
           done
 
           echo "4 hours completed."
 
-      # =====================================================
+      # ==========================================
       # Save workspace
-      # =====================================================
+      # ==========================================
 
       - name: Save workspace
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dao-workspace
-          path: |
-            ${{ env.HOME }}/dao-workspace/
+          path: /home/runner/dao-workspace/
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
-      # =====================================================
+      # ==========================================
       # Save logs
-      # =====================================================
+      # ==========================================
 
       - name: Save logs
         if: always()
@@ -347,29 +407,28 @@ jobs:
         with:
           name: dao-desktop-logs
           path: |
-            ${{ env.HOME }}/dao-logs/
-            ${{ env.HOME }}/.vnc/
+            /home/runner/dao-logs/
+            /home/runner/.vnc/
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
-      # =====================================================
+      # ==========================================
       # Shutdown
-      # =====================================================
+      # ==========================================
 
-      - name: Shutdown desktop
+      - name: Shutdown
         if: always()
         run: |
-          echo "Stopping desktop..."
 
-          if [ -f "$HOME/dao-logs/cloudflared.pid" ]; then
-            kill "$(cat "$HOME/dao-logs/cloudflared.pid")" 2>/dev/null || true
+          echo "Stopping services..."
+
+          if [ -f "$LOGDIR/cloudflared.pid" ]; then
+            kill "$(cat "$LOGDIR/cloudflared.pid")" 2>/dev/null || true
           fi
 
-          if [ -f "$HOME/dao-logs/novnc.pid" ]; then
-            kill "$(cat "$HOME/dao-logs/novnc.pid")" 2>/dev/null || true
+          if [ -f "$LOGDIR/novnc.pid" ]; then
+            kill "$(cat "$LOGDIR/novnc.pid")" 2>/dev/null || true
           fi
-
-          vncserver -kill :1 2>/dev/null || true
 
           pkill -9 Xtigervnc 2>/dev/null || true
           pkill -9 websockify 2>/dev/null || true
