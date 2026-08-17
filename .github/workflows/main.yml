@@ -26,7 +26,7 @@ jobs:
   desktop:
     name: DAO Windows Desktop
     runs-on: windows-2025
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     defaults:
       run:
@@ -557,14 +557,12 @@ jobs:
           $cloudflaredPath = Join-Path $env:DAO_TOOLS "cloudflared.exe"
 
           if (-not (Test-Path $cloudflaredPath)) {
-
             Write-Host "Downloading cloudflared..."
 
             Invoke-WebRequest `
               -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
               -OutFile $cloudflaredPath `
               -UseBasicParsing
-
           }
 
           if (-not (Test-Path $cloudflaredPath)) {
@@ -574,7 +572,6 @@ jobs:
           Write-Host "cloudflared path:"
           Write-Host $cloudflaredPath
 
-          # Verify executable
           & $cloudflaredPath --version
 
           if ($LASTEXITCODE -ne 0) {
@@ -583,7 +580,15 @@ jobs:
 
           Write-Host "Starting Cloudflare Quick Tunnel..."
 
-          Start-Process `
+          if (Test-Path $cloudLog) {
+            Remove-Item $cloudLog -Force -ErrorAction SilentlyContinue
+          }
+
+          if (Test-Path $cloudError) {
+            Remove-Item $cloudError -Force -ErrorAction SilentlyContinue
+          }
+
+          $cloudProcess = Start-Process `
             -FilePath $cloudflaredPath `
             -ArgumentList @(
               "tunnel",
@@ -593,14 +598,21 @@ jobs:
             ) `
             -RedirectStandardOutput $cloudLog `
             -RedirectStandardError $cloudError `
-            -WindowStyle Hidden
+            -WindowStyle Hidden `
+            -PassThru
+
+          Write-Host "cloudflared PID: $($cloudProcess.Id)"
 
           $publicUrl = $null
           $deadline = (Get-Date).AddSeconds(120)
 
           while ((Get-Date) -lt $deadline) {
-
             Start-Sleep -Seconds 2
+
+            if ($cloudProcess.HasExited) {
+              Write-Host "cloudflared exited unexpectedly."
+              break
+            }
 
             $text = ""
 
@@ -618,13 +630,12 @@ jobs:
             )
 
             if ($match.Success) {
-              $publicUrl = $match.Value
+              $publicUrl = $match.Value.TrimEnd("/")
               break
             }
           }
 
           if (-not $publicUrl) {
-
             Write-Host "Cloudflare output:"
 
             if (Test-Path $cloudLog) {
@@ -637,7 +648,14 @@ jobs:
 
             throw "Cloudflare tunnel URL was not found."
           }
-          
+
+          $remoteUrl = "$publicUrl/vnc.html"
+
+          Set-Content `
+            -Path (Join-Path $env:DAO_LOGS "remote-url.txt") `
+            -Value $remoteUrl `
+            -NoNewline
+
           Write-Host ""
           Write-Host "=========================================="
           Write-Host "REMOTE DESKTOP READY"
@@ -698,7 +716,6 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $totalSeconds = 14400
-          $backupAt = 13800
 
           $start = Get-Date
 
@@ -706,11 +723,10 @@ jobs:
           Write-Host "=========================================="
           Write-Host "DAO DESKTOP ACTIVE"
           Write-Host "Runtime: 4 hours"
-          Write-Host "Backup: 10 minutes before shutdown"
+          Write-Host "Cloudflare Tunnel: Active"
           Write-Host "=========================================="
 
           while ($true) {
-
             $elapsed = [int]((Get-Date).Subtract($start).TotalSeconds)
 
             if ($elapsed -ge $totalSeconds) {
@@ -737,11 +753,20 @@ jobs:
               $leftSeconds
             )
 
+            if ($cloudProcess -and $cloudProcess.HasExited) {
+              Write-Warning "cloudflared stopped. The current Quick Tunnel URL is no longer valid."
+              Write-Warning "Cloudflare log:"
+              if (Test-Path $cloudError) {
+                Get-Content $cloudError -Tail 50
+              }
+              throw "Cloudflare Tunnel stopped unexpectedly."
+            }
+
             Start-Sleep -Seconds 15
           }
 
-          Write-Host ""
           Write-Host "Runtime finished."
+
       # ==========================================================
       # 11. BACKUP
       # ==========================================================
