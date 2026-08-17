@@ -1,0 +1,669 @@
+name: DAO Windows Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  desktop:
+    name: DAO Windows Desktop
+    runs-on: windows-2025
+    timeout-minutes: 240
+
+    env:
+      WORKSPACE: D:\DAO-Workspace
+      BACKUP: D:\DAO-Backup
+      LOGDIR: D:\DAO-Logs
+
+    steps:
+
+      # ============================================================
+      # 1. Prepare
+      # ============================================================
+
+      - name: Prepare directories
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path $env:WORKSPACE | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:BACKUP | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:LOGDIR | Out-Null
+
+          Write-Host "=========================================="
+          Write-Host " DAO WINDOWS DESKTOP"
+          Write-Host "=========================================="
+          Write-Host "Workspace: $env:WORKSPACE"
+          Write-Host "Backup:    $env:BACKUP"
+          Write-Host "Logs:      $env:LOGDIR"
+          Write-Host "=========================================="
+
+      # ============================================================
+      # 2. Find previous artifact
+      # ============================================================
+
+      - name: Find previous backup
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts?name=dao-windows-backup&per_page=100"
+
+          $result = Invoke-RestMethod `
+            -Uri $url `
+            -Headers $headers `
+            -Method Get
+
+          $artifact = $result.artifacts |
+            Where-Object { $_.expired -eq $false } |
+            Sort-Object created_at -Descending |
+            Select-Object -First 1
+
+          if ($artifact) {
+
+            Write-Host "Previous backup found:"
+            Write-Host "Artifact ID: $($artifact.id)"
+            Write-Host "Created:     $($artifact.created_at)"
+
+            "artifact_id=$($artifact.id)" |
+              Out-File `
+                -FilePath $env:GITHUB_OUTPUT `
+                -Append
+
+          } else {
+
+            Write-Host "No previous backup found."
+
+            "artifact_id=" |
+              Out-File `
+                -FilePath $env:GITHUB_OUTPUT `
+                -Append
+          }
+
+      # ============================================================
+      # 3. Restore previous backup
+      # ============================================================
+
+      - name: Restore previous backup
+        if: steps.previous.outputs.artifact_id != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $artifactId = "${{ steps.previous.outputs.artifact_id }}"
+
+          $downloadUrl =
+            "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$artifactId/zip"
+
+          Write-Host "Downloading backup..."
+
+          Invoke-WebRequest `
+            -Uri $downloadUrl `
+            -Headers $headers `
+            -OutFile "$env:TEMP\dao-backup.zip"
+
+          Write-Host "Extracting backup..."
+
+          Expand-Archive `
+            -Path "$env:TEMP\dao-backup.zip" `
+            -DestinationPath "$env:BACKUP" `
+            -Force
+
+          # Restore workspace
+          if (Test-Path "$env:BACKUP\workspace") {
+
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $env:WORKSPACE |
+              Out-Null
+
+            Copy-Item `
+              "$env:BACKUP\workspace\*" `
+              "$env:WORKSPACE" `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Backup restored."
+
+      # ============================================================
+      # 4. Install FileZilla
+      # ============================================================
+
+      - name: Install FileZilla
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://download.filezilla-project.org/client/FileZilla_3.70.2_win64-setup.exe"
+
+          $installer = "$env:TEMP\FileZilla.exe"
+
+          Write-Host "Downloading FileZilla..."
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          Write-Host "Installing FileZilla..."
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/S" `
+            -Wait
+
+          Write-Host "FileZilla installation completed."
+
+      # ============================================================
+      # 5. Install Geany
+      # ============================================================
+
+      - name: Install Geany
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://download.geany.org/geany-2.0_setup.exe"
+
+          $installer = "$env:TEMP\Geany.exe"
+
+          Write-Host "Downloading Geany..."
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          Write-Host "Installing Geany..."
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/S" `
+            -Wait
+
+          Write-Host "Geany installation completed."
+
+      # ============================================================
+      # 6. Install TightVNC
+      # ============================================================
+
+      - name: Install TightVNC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://www.tightvnc.com/download/2.8.88/tightvnc-2.8.88-gpl-setup-64bit.msi"
+
+          $installer = "$env:TEMP\TightVNC.msi"
+
+          Write-Host "Downloading TightVNC..."
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          Write-Host "Installing TightVNC..."
+
+          $arguments = @(
+            "/i"
+            "`"$installer`""
+            "/quiet"
+            "/norestart"
+            "ADDLOCAL=Server,Viewer"
+            "SERVER_REGISTER_AS_SERVICE=1"
+            "SERVER_ADD_FIREWALL_EXCEPTION=1"
+          )
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList $arguments `
+            -Wait
+
+          Write-Host "TightVNC installation completed."
+
+      # ============================================================
+      # 7. Configure TightVNC
+      # ============================================================
+
+      - name: Configure VNC
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            throw "VNC_PASSWORD secret is missing."
+          }
+
+          $vnc = "C:\Program Files\TightVNC\tvnserver.exe"
+
+          if (!(Test-Path $vnc)) {
+            $vnc = "C:\Program Files\TightVNC\tvnserver.exe"
+          }
+
+          if (!(Test-Path $vnc)) {
+            throw "TightVNC server executable not found."
+          }
+
+          Write-Host "Configuring TightVNC..."
+
+          # Start service
+          & $vnc -start -silent
+
+          Start-Sleep -Seconds 5
+
+          # Open configuration only if required.
+          # Password configuration is intentionally kept
+          # out of the workflow command line because secrets
+          # should not be exposed in process arguments.
+
+          Write-Host "TightVNC service started."
+
+      # ============================================================
+      # 8. Install AnyDesk
+      # ============================================================
+
+      - name: Install AnyDesk
+        shell: pwsh
+        env:
+          ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
+            throw "ANYDESK_PASSWORD secret is missing."
+          }
+
+          $installer = "$env:TEMP\AnyDesk.exe"
+
+          Write-Host "Downloading AnyDesk..."
+
+          Invoke-WebRequest `
+            -Uri "https://download.anydesk.com/AnyDesk.exe" `
+            -OutFile $installer
+
+          Write-Host "Installing AnyDesk..."
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList `
+              "--install `"C:\Program Files (x86)\AnyDesk`" --start-with-win --silent" `
+            -Wait
+
+          Start-Sleep -Seconds 8
+
+          $anydesk = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+
+          if (!(Test-Path $anydesk)) {
+            throw "AnyDesk executable was not found."
+          }
+
+          Write-Host "AnyDesk installed."
+
+          # Start AnyDesk service
+          & $anydesk --start
+
+          Start-Sleep -Seconds 5
+
+          # Configure unattended access
+          $env:ANYDESK_PASSWORD |
+            & $anydesk --set-password _unattended_access
+
+          Write-Host "AnyDesk unattended access configured."
+
+      # ============================================================
+      # 9. Get AnyDesk ID
+      # ============================================================
+
+      - name: Get AnyDesk ID
+        shell: pwsh
+        run: |
+          $anydesk = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+
+          if (Test-Path $anydesk) {
+
+            Start-Sleep -Seconds 5
+
+            $id = & $anydesk --get-id 2>$null |
+              Out-String
+
+            $id = $id.Trim()
+
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "           ANYDESK"
+            Write-Host "=========================================="
+            Write-Host "ID:"
+            Write-Host $id
+            Write-Host "=========================================="
+            Write-Host ""
+
+            Set-Content `
+              -Path "$env:LOGDIR\anydesk-id.txt" `
+              -Value $id
+          }
+
+      # ============================================================
+      # 10. Create workspace shortcuts
+      # ============================================================
+
+      - name: Configure workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $desktop =
+            [Environment]::GetFolderPath("Desktop")
+
+          $workspaceShortcut =
+            "$desktop\DAO Workspace.lnk"
+
+          $shell =
+            New-Object -ComObject WScript.Shell
+
+          $shortcut =
+            $shell.CreateShortcut($workspaceShortcut)
+
+          $shortcut.TargetPath =
+            "explorer.exe"
+
+          $shortcut.Arguments =
+            "`"$env:WORKSPACE`""
+
+          $shortcut.Save()
+
+          Write-Host "Workspace shortcut created."
+
+      # ============================================================
+      # 11. Start applications
+      # ============================================================
+
+      - name: Start applications
+        shell: pwsh
+        run: |
+
+          $filezilla =
+            "C:\Program Files\FileZilla FTP Client\filezilla.exe"
+
+          $geany =
+            "C:\Program Files\Geany\bin\geany.exe"
+
+          $anydesk =
+            "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+
+          if (Test-Path $filezilla) {
+
+            Start-Process `
+              -FilePath $filezilla
+          }
+
+          if (Test-Path $geany) {
+
+            Start-Process `
+              -FilePath $geany
+          }
+
+          if (Test-Path $anydesk) {
+
+            Start-Process `
+              -FilePath $anydesk
+          }
+
+      # ============================================================
+      # 12. Show system information
+      # ============================================================
+
+      - name: Show connection information
+        shell: pwsh
+        run: |
+
+          $anydeskId = ""
+
+          if (Test-Path "$env:LOGDIR\anydesk-id.txt") {
+
+            $anydeskId =
+              Get-Content "$env:LOGDIR\anydesk-id.txt"
+          }
+
+          $info = @"
+          ==============================================
+                  DAO WINDOWS DESKTOP
+          ==============================================
+
+          OS:
+          Windows 2025
+
+          Applications:
+          FileZilla
+          Geany
+          AnyDesk
+          TightVNC
+
+          Workspace:
+          $env:WORKSPACE
+
+          AnyDesk ID:
+          $anydeskId
+
+          VNC Port:
+          5900
+
+          ==============================================
+          "@
+
+          Write-Host $info
+
+          Set-Content `
+            -Path "$env:LOGDIR\connection-info.txt" `
+            -Value $info
+
+      # ============================================================
+      # 13. Keep alive - 4 hours
+      # ============================================================
+
+      - name: Keep desktop alive
+        shell: pwsh
+        run: |
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " Windows Desktop is running"
+          Write-Host " Maximum runtime: 4 hours"
+          Write-Host "=========================================="
+          Write-Host ""
+
+          for ($minute = 1; $minute -le 240; $minute++) {
+
+            Write-Host `
+              "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] " +
+              "Desktop active: $minute / 240 minutes"
+
+            Start-Sleep -Seconds 60
+          }
+
+          Write-Host "4 hours completed."
+
+      # ============================================================
+      # 14. Backup everything
+      # ============================================================
+
+      - name: Prepare backup
+        if: always()
+        shell: pwsh
+        run: |
+
+          $ErrorActionPreference = "Continue"
+
+          $backupWorkspace =
+            "$env:BACKUP\workspace"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $backupWorkspace |
+            Out-Null
+
+          # Workspace
+          if (Test-Path $env:WORKSPACE) {
+
+            Copy-Item `
+              "$env:WORKSPACE\*" `
+              $backupWorkspace `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          # FileZilla configuration
+          $fzSource =
+            "$env:APPDATA\FileZilla"
+
+          $fzTarget =
+            "$env:BACKUP\FileZilla"
+
+          if (Test-Path $fzSource) {
+
+            Copy-Item `
+              $fzSource `
+              $fzTarget `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          # Geany configuration
+          $geanySource =
+            "$env:APPDATA\geany"
+
+          $geanyTarget =
+            "$env:BACKUP\Geany"
+
+          if (Test-Path $geanySource) {
+
+            Copy-Item `
+              $geanySource `
+              $geanyTarget `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          # Useful user documents
+          $documents =
+            [Environment]::GetFolderPath("MyDocuments")
+
+          $documentTarget =
+            "$env:BACKUP\Documents"
+
+          if (Test-Path $documents) {
+
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $documentTarget |
+              Out-Null
+
+            Copy-Item `
+              "$documents\*" `
+              $documentTarget `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          # Connection information
+          if (Test-Path $env:LOGDIR) {
+
+            Copy-Item `
+              "$env:LOGDIR\*" `
+              "$env:BACKUP\Logs" `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Backup prepared."
+
+      # ============================================================
+      # 15. Upload backup
+      # ============================================================
+
+      - name: Upload backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dao-windows-backup
+          path: D:\DAO-Backup\
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ============================================================
+      # 16. Upload logs
+      # ============================================================
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dao-windows-logs
+          path: D:\DAO-Logs\
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ============================================================
+      # 17. Shutdown
+      # ============================================================
+
+      - name: Shutdown
+        if: always()
+        shell: pwsh
+        run: |
+
+          Write-Host "Stopping desktop applications..."
+
+          Stop-Process `
+            -Name "filezilla" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Stop-Process `
+            -Name "geany" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Stop-Process `
+            -Name "AnyDesk" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          $vnc =
+            "C:\Program Files\TightVNC\tvnserver.exe"
+
+          if (Test-Path $vnc) {
+
+            & $vnc -stop -silent 2>$null
+          }
+
+          Write-Host "Desktop stopped."
