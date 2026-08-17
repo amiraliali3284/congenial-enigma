@@ -695,10 +695,10 @@ jobs:
       - name: Run DAO Desktop
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
 
-          $totalSeconds = 240
-          $backupAt = 230
+          $totalSeconds = 14400
+          $backupAt = 13800
 
           $start = Get-Date
 
@@ -710,7 +710,8 @@ jobs:
           Write-Host "=========================================="
 
           while ($true) {
-            $elapsed = [int]((Get-Date - $start).TotalSeconds)
+
+            $elapsed = [int]((Get-Date).Subtract($start).TotalSeconds)
 
             if ($elapsed -ge $totalSeconds) {
               break
@@ -718,13 +719,13 @@ jobs:
 
             $remaining = $totalSeconds - $elapsed
 
-            $hours = [math]::Floor($elapsed / 3600)
-            $minutes = [math]::Floor(($elapsed % 3600) / 60)
-            $seconds = $elapsed % 60
+            $hours = [int][math]::Floor($elapsed / 3600)
+            $minutes = [int][math]::Floor(($elapsed % 3600) / 60)
+            $seconds = [int]($elapsed % 60)
 
-            $leftHours = [math]::Floor($remaining / 3600)
-            $leftMinutes = [math]::Floor(($remaining % 3600) / 60)
-            $leftSeconds = $remaining % 60
+            $leftHours = [int][math]::Floor($remaining / 3600)
+            $leftMinutes = [int][math]::Floor(($remaining % 3600) / 60)
+            $leftSeconds = [int]($remaining % 60)
 
             Write-Host (
               "Runtime {0:D2}:{1:D2}:{2:D2} | Remaining {3:D2}:{4:D2}:{5:D2}" -f `
@@ -739,8 +740,8 @@ jobs:
             Start-Sleep -Seconds 15
           }
 
+          Write-Host ""
           Write-Host "Runtime finished."
-
       # ==========================================================
       # 11. BACKUP
       # ==========================================================
