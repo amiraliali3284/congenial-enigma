@@ -8,207 +8,127 @@ permissions:
   actions: read
 
 jobs:
-  dao-windows-desktop:
+  dao-desktop:
     name: DAO Windows Desktop
     runs-on: windows-2025
-
-    # This is the TOTAL job lifetime.
-    # The internal desktop runtime is intentionally shorter so that
-    # backup/upload have time to finish.
     timeout-minutes: 240
 
     env:
       DAO_WORKSPACE: D:\DAO-Workspace
       DAO_LOGS: D:\DAO-Logs
-      DAO_TOOLS: D:\DAO-Tools
-      DAO_BACKUP_STAGING: D:\DAO-Backup-Staging
-
-      VNC_PORT: "5900"
-      NOVNC_PORT: "6080"
-
-      NOVNC_VERSION: "1.7.0"
-      WEBSOCKIFY_VERSION: "0.13.0"
-
-      # Reserve time for final backup and artifact upload.
-      DESKTOP_RUNTIME_MINUTES: "220"
+      DAO_RUNTIME_MINUTES: "225"
 
     steps:
 
       # ------------------------------------------------------------
-      # CHECKOUT
+      # Checkout
       # ------------------------------------------------------------
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------
-      # DIRECTORIES
+      # Prepare directories
       # ------------------------------------------------------------
-
-      - name: Initialize DAO directories
+      - name: Prepare DAO directories
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "D:\DAO-Workspace" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\DAO-Logs" | Out-Null
 
-          $directories = @(
-            $env:DAO_WORKSPACE,
-            $env:DAO_LOGS,
-            $env:DAO_TOOLS,
-            $env:DAO_BACKUP_STAGING
-          )
-
-          foreach ($directory in $directories) {
-            New-Item `
-              -ItemType Directory `
-              -Path $directory `
-              -Force | Out-Null
-          }
-
-          Write-Host "DAO directories initialized."
+          Write-Host "DAO directories prepared."
+          Write-Host "Workspace: D:\DAO-Workspace"
+          Write-Host "Logs:      D:\DAO-Logs"
 
       # ------------------------------------------------------------
-      # RESTORE
+      # Restore latest backup
       # ------------------------------------------------------------
-
       - name: Restore latest DAO backup
-        id: restore
-        continue-on-error: true
         shell: powershell
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           & "$env:GITHUB_WORKSPACE\scripts\restore.ps1"
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Restore returned exit code $LASTEXITCODE."
-          }
-
       # ------------------------------------------------------------
-      # START DESKTOP
+      # Install and start desktop
       # ------------------------------------------------------------
-
-      - name: Install and start DAO Desktop
-        id: desktop
-        continue-on-error: true
+      - name: Start DAO Windows Desktop
         shell: powershell
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
-          if (-not [string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-            Write-Output "::add-mask::$env:VNC_PASSWORD"
-          }
-
-          if (-not [string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
-            Write-Output "::add-mask::$env:ANYDESK_PASSWORD"
-          }
-
-          & "$env:GITHUB_WORKSPACE\scripts\desktop.ps1"
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Desktop setup returned exit code $LASTEXITCODE."
-          }
+          & "$env:GITHUB_WORKSPACE\scripts\desktop.ps1" `
+            -RuntimeMinutes ([int]$env:DAO_RUNTIME_MINUTES)
 
       # ------------------------------------------------------------
-      # RUNTIME
+      # Backup
       # ------------------------------------------------------------
-
-      - name: Keep DAO Desktop alive
-        id: runtime
-        continue-on-error: true
-        if: ${{ !cancelled() }}
+      - name: Create DAO backup
+        if: always()
         shell: powershell
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-          ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
-          & "$env:GITHUB_WORKSPACE\scripts\desktop.ps1" -RuntimeOnly
+          Write-Host "Creating final DAO backup..."
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Runtime supervisor returned exit code $LASTEXITCODE."
+          try {
+            & "$env:GITHUB_WORKSPACE\scripts\backup.ps1"
+          }
+          catch {
+            Write-Warning "Backup script failed: $($_.Exception.Message)"
           }
 
       # ------------------------------------------------------------
-      # FINAL BACKUP
+      # Upload backup
       # ------------------------------------------------------------
-
-      - name: Create final DAO backup
-        id: backup
-        continue-on-error: true
-        if: ${{ !cancelled() }}
-        shell: powershell
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-          ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
-        run: |
-          & "$env:GITHUB_WORKSPACE\scripts\backup.ps1"
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Backup returned exit code $LASTEXITCODE."
-          }
-
-      # ------------------------------------------------------------
-      # UPLOAD BACKUP
-      # ------------------------------------------------------------
-
-      - name: Upload DAO backup
-        id: upload-backup
-        if: ${{ !cancelled() }}
+      - name: Upload DAO backup artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dao-windows-backup
-          path: D:\DAO-Backup-Staging
-          if-no-files-found: error
-          compression-level: 6
+          path: D:\DAO-Logs\dao-windows-backup.zip
+          if-no-files-found: warn
           retention-days: 14
-          overwrite: true
+          compression-level: 0
 
       # ------------------------------------------------------------
-      # UPLOAD LOGS
+      # Upload logs
       # ------------------------------------------------------------
-
       - name: Upload DAO logs
-        id: upload-logs
-        if: ${{ !cancelled() }}
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dao-windows-logs
-          path: D:\DAO-Logs
+          path: |
+            D:\DAO-Logs\**
           if-no-files-found: warn
-          compression-level: 6
           retention-days: 14
-          overwrite: true
+          compression-level: 6
 
       # ------------------------------------------------------------
-      # FINAL DASHBOARD
+      # Final dashboard
       # ------------------------------------------------------------
-
-      - name: Print final DAO dashboard
-        if: ${{ always() }}
+      - name: Final DAO dashboard
+        if: always()
         shell: powershell
         run: |
           Write-Host ""
-          Write-Host "============================================================"
-          Write-Host "                 DAO WINDOWS DESKTOP"
-          Write-Host "============================================================"
+          Write-Host "=============================================="
+          Write-Host "        DAO WINDOWS DESKTOP"
+          Write-Host "=============================================="
           Write-Host ""
 
-          $dashboard = Join-Path $env:DAO_LOGS "connection-info.txt"
+          $info = "D:\DAO-Logs\connection-info.txt"
 
-          if (Test-Path -LiteralPath $dashboard) {
-            Get-Content -LiteralPath $dashboard
+          if (Test-Path $info) {
+            Get-Content $info
           }
           else {
-            Write-Host "Dashboard unavailable."
+            Write-Host "connection-info.txt was not created."
           }
 
           Write-Host ""
-          Write-Host "Logs:"
-          Write-Host "D:\DAO-Logs"
-          Write-Host ""
-          Write-Host "Workspace:"
-          Write-Host "D:\DAO-Workspace"
-          Write-Host ""
-          Write-Host "============================================================"
+          Write-Host "=============================================="
+          Write-Host "Artifacts:"
+          Write-Host "  dao-windows-backup"
+          Write-Host "  dao-windows-logs"
+          Write-Host "=============================================="
