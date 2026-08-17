@@ -15,17 +15,9 @@ env:
   DAO_ROOT: D:\DAO-Workspace
   DAO_BACKUP: D:\DAO-Backup
   DAO_RESTORE: D:\DAO-Restore
-
   BACKUP_NAME: dao-windows-backup
 
-  # 4 hours total
-  TOTAL_SECONDS: 14400
-
-  # Start backup 10 minutes before shutdown
-  BACKUP_SECONDS: 600
-
 jobs:
-
   desktop:
     name: DAO Windows Desktop
     runs-on: windows-2025
@@ -37,49 +29,32 @@ jobs:
 
     steps:
 
-      # ==========================================================
-      # 1. CHECKOUT
-      # ==========================================================
-
       - name: Checkout
         uses: actions/checkout@v5
         with:
           persist-credentials: false
           fetch-depth: 1
 
-
-      # ==========================================================
-      # 2. PREPARE DIRECTORIES
-      # ==========================================================
-
-      - name: Prepare workspace
+      - name: Prepare directories
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = 'Stop'
 
-          foreach ($dir in @(
-            $env:DAO_ROOT,
-            $env:DAO_BACKUP,
-            $env:DAO_RESTORE
-          )) {
-            New-Item `
-              -ItemType Directory `
-              -Path $dir `
-              -Force | Out-Null
-          }
+          New-Item `
+            -ItemType Directory `
+            -Path $env:DAO_ROOT `
+            -Force | Out-Null
 
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host " DAO WINDOWS DESKTOP"
-          Write-Host "======================================"
-          Write-Host "Runner: $env:RUNNER_NAME"
-          Write-Host "OS: $env:RUNNER_OS"
-          Write-Host "Workspace: $env:DAO_ROOT"
-          Write-Host ""
+          New-Item `
+            -ItemType Directory `
+            -Path $env:DAO_BACKUP `
+            -Force | Out-Null
 
+          New-Item `
+            -ItemType Directory `
+            -Path $env:DAO_RESTORE `
+            -Force | Out-Null
 
-      # ==========================================================
-      # 3. RESTORE LAST BACKUP
-      # ==========================================================
+          Write-Host "DAO workspace ready."
 
       - name: Find previous backup
         id: find_backup
@@ -88,14 +63,10 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           CURRENT_RUN: ${{ github.run_id }}
         run: |
-
-          $ErrorActionPreference = "Continue"
-
           $found = $false
-          $runId = ""
+          $runId = ''
 
           try {
-
             $runs = gh run list `
               --repo $env:REPOSITORY `
               --workflow windows-desktop.yml `
@@ -110,57 +81,54 @@ jobs:
                 continue
               }
 
-              if ($run.conclusion -ne "success") {
+              if ($run.conclusion -ne 'success') {
                 continue
               }
 
               try {
+                $api = "/repos/$env:REPOSITORY/actions/runs/$($run.databaseId)/artifacts?per_page=100"
 
-                $api =
-                  "/repos/$env:REPOSITORY/actions/runs/$($run.databaseId)/artifacts?per_page=100"
+                $result = gh api `
+                  -H "Accept: application/vnd.github+json" `
+                  $api |
+                  ConvertFrom-Json
 
-                $artifacts =
-                  gh api `
-                    -H "Accept: application/vnd.github+json" `
-                    $api |
-                    ConvertFrom-Json
+                $artifact = @(
+                  $result.artifacts |
+                  Where-Object {
+                    $_.name -eq $env:BACKUP_NAME -and
+                    $_.expired -eq $false
+                  }
+                ) |
+                Select-Object -First 1
 
-                $backup =
-                  @(
-                    $artifacts.artifacts |
-                    Where-Object {
-                      $_.name -eq $env:BACKUP_NAME -and
-                      $_.expired -eq $false
-                    }
-                  ) |
-                  Select-Object -First 1
-
-                if ($backup) {
-
+                if ($null -ne $artifact) {
                   $found = $true
                   $runId = "$($run.databaseId)"
-
-                  Write-Host "[OK] Previous backup found."
-                  Write-Host "Run: $runId"
-
                   break
                 }
 
-              } catch {
-                Write-Warning "Could not inspect run $($run.databaseId)"
+              }
+              catch {
+                Write-Warning "Could not inspect run $($run.databaseId)."
               }
             }
-
-          } catch {
-            Write-Warning "Could not find previous backup."
+          }
+          catch {
+            Write-Warning "Backup discovery failed."
           }
 
-          "found=$($found.ToString().ToLower())" |
-            Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "found=$($found.ToString().ToLowerInvariant())" |
+            Out-File `
+              $env:GITHUB_OUTPUT `
+              -Append `
+              -Encoding utf8
 
           "run_id=$runId" |
-            Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-
+            Out-File `
+              $env:GITHUB_OUTPUT `
+              -Append `
+              -Encoding utf8
 
       - name: Download previous backup
         if: steps.find_backup.outputs.found == 'true'
@@ -169,8 +137,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           BACKUP_RUN: ${{ steps.find_backup.outputs.run_id }}
         run: |
-
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = 'Stop'
 
           Remove-Item `
             $env:DAO_RESTORE `
@@ -183,7 +150,7 @@ jobs:
             -Path $env:DAO_RESTORE `
             -Force | Out-Null
 
-          Write-Host "Downloading previous DAO backup..."
+          Write-Host "Downloading previous backup..."
 
           gh run download `
             $env:BACKUP_RUN `
@@ -192,37 +159,31 @@ jobs:
             --dir $env:DAO_RESTORE
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Backup download failed."
+            throw 'Backup download failed.'
           }
 
-          Write-Host "[OK] Backup downloaded."
+          Write-Host '[OK] Backup downloaded.'
 
-
-      - name: Restore previous workspace
-        if: always()
+      - name: Restore previous backup
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          $ErrorActionPreference = "Continue"
+          $zip = Get-ChildItem `
+            $env:DAO_RESTORE `
+            -Recurse `
+            -Filter 'dao-state.zip' `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
 
-          $zip =
-            Get-ChildItem `
-              $env:DAO_RESTORE `
-              -Recurse `
-              -Filter "dao-state.zip" `
-              -File `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-
-          if (-not $zip) {
-
-            Write-Host "[INFO] No previous backup."
+          if ($null -eq $zip) {
+            Write-Host '[INFO] No previous backup found.'
             exit 0
           }
 
-          $temp =
-            Join-Path `
-              $env:TEMP `
-              "dao-restore"
+          $temp = Join-Path `
+            $env:TEMP `
+            'dao-restore'
 
           Remove-Item `
             $temp `
@@ -257,60 +218,39 @@ jobs:
             -Recurse `
             -Force
 
-          Write-Host "[OK] Previous workspace restored."
+          Write-Host '[OK] Previous backup restored.'
 
-
-      # ==========================================================
-      # 4. INSTALL FILEZILLA + NOTEPAD++
-      # ==========================================================
-
-      - name: Install applications
+      - name: Install FileZilla and Notepad++
         run: |
+          $ErrorActionPreference = 'Continue'
 
-          $ErrorActionPreference = "Continue"
+          Write-Host 'Installing FileZilla...'
 
-          function Install-App {
-            param(
-              [string]$Id,
-              [string]$Name
-            )
+          winget install `
+            --id FileZilla.FileZilla `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements `
+            --disable-interactivity
 
-            Write-Host ""
-            Write-Host "Installing/checking $Name..."
+          Write-Host 'Installing Notepad++...'
 
-            winget install `
-              --id $Id `
-              --exact `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements `
-              --disable-interactivity
+          winget install `
+            --id Notepad++.Notepad++ `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements `
+            --disable-interactivity
 
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "[OK] $Name ready."
-            }
-            else {
-              Write-Warning "$Name returned exit code $LASTEXITCODE"
-            }
-          }
-
-          Install-App `
-            "FileZilla.FileZilla" `
-            "FileZilla"
-
-          Install-App `
-            "Notepad++.Notepad++" `
-            "Notepad++"
-
-
-      # ==========================================================
-      # 5. INSTALL ANYDESK
-      # ==========================================================
+          Write-Host '[OK] Applications installed.'
 
       - name: Install AnyDesk
         run: |
+          $ErrorActionPreference = 'Continue'
 
-          $ErrorActionPreference = "Stop"
+          Write-Host 'Installing AnyDesk...'
 
           winget install `
             --id AnyDeskSoftwareGmbH.AnyDesk `
@@ -320,52 +260,34 @@ jobs:
             --accept-source-agreements `
             --disable-interactivity
 
-          if ($LASTEXITCODE -ne 0) {
-
-            Write-Warning "AnyDesk installation returned $LASTEXITCODE"
-          }
-
           Start-Sleep -Seconds 5
-
-
-      # ==========================================================
-      # 6. CONFIGURE REMOTE
-      # ==========================================================
 
       - name: Configure AnyDesk
         env:
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
+            throw 'GitHub Secret ANYDESK_PASSWORD is missing.'
+          }
 
           $anydesk = $null
 
-          foreach ($path in @(
+          $paths = @(
             "$env:ProgramFiles\AnyDesk\AnyDesk.exe",
-            "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe",
-            "$env:ProgramFiles\AnyDesk-*\AnyDesk*.exe",
-            "${env:ProgramFiles(x86)}\AnyDesk-*\AnyDesk*.exe"
-          )) {
+            "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe"
+          )
 
-            $item =
-              Get-Item `
-                $path `
-                -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-
-            if ($item) {
-              $anydesk = $item.FullName
+          foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) {
+              $anydesk = $path
               break
             }
           }
 
           if (-not $anydesk) {
-
-            $cmd =
-              Get-Command `
-                AnyDesk.exe `
-                -ErrorAction SilentlyContinue
+            $cmd = Get-Command AnyDesk.exe -ErrorAction SilentlyContinue
 
             if ($cmd) {
               $anydesk = $cmd.Source
@@ -373,41 +295,29 @@ jobs:
           }
 
           if (-not $anydesk) {
-            throw "AnyDesk.exe not found."
+            throw 'AnyDesk.exe was not found.'
           }
 
           Write-Host "AnyDesk: $anydesk"
 
-          # Start AnyDesk
           Start-Process `
             -FilePath $anydesk `
-            -ArgumentList "--start" `
+            -ArgumentList '--start' `
             -WindowStyle Hidden
 
           Start-Sleep -Seconds 8
 
-          # Set unattended access password
-          if (
-            [string]::IsNullOrWhiteSpace(
-              $env:ANYDESK_PASSWORD
-            )
-          ) {
-            throw "ANYDESK_PASSWORD secret is missing."
-          }
-
-          $psi =
-            [System.Diagnostics.ProcessStartInfo]::new()
+          $psi = [System.Diagnostics.ProcessStartInfo]::new()
 
           $psi.FileName = $anydesk
-          $psi.Arguments = "--set-password"
+          $psi.Arguments = '--set-password'
           $psi.UseShellExecute = $false
           $psi.RedirectStandardInput = $true
           $psi.RedirectStandardOutput = $true
           $psi.RedirectStandardError = $true
           $psi.CreateNoWindow = $true
 
-          $process =
-            [System.Diagnostics.Process]::new()
+          $process = [System.Diagnostics.Process]::new()
 
           $process.StartInfo = $psi
 
@@ -419,191 +329,127 @@ jobs:
 
           $process.StandardInput.Close()
 
-          $stdout =
-            $process.StandardOutput.ReadToEnd()
-
-          $stderr =
-            $process.StandardError.ReadToEnd()
+          $null = $process.StandardOutput.ReadToEnd()
+          $null = $process.StandardError.ReadToEnd()
 
           $process.WaitForExit()
 
-          # Get ID
-          $idOutput =
-            & $anydesk `
-              --get-id `
-              2>&1
+          $idOutput = & $anydesk --get-id 2>&1
 
-          $idText =
-            ($idOutput | Out-String)
+          $idText = $idOutput | Out-String
 
-          $match =
-            [regex]::Match(
-              $idText,
-              "\b\d{6,12}\b"
-            )
+          $match = [regex]::Match(
+            $idText,
+            '\b\d{6,12}\b'
+          )
 
           if (-not $match.Success) {
-
-            Write-Host "AnyDesk output:"
-            Write-Host $idText
-
-            throw "Could not detect AnyDesk ID."
+            throw 'Could not detect AnyDesk ID.'
           }
 
           $anydeskId = $match.Value
 
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "        DAO REMOTE DESKTOP"
-          Write-Host "======================================"
-          Write-Host ""
-          Write-Host "Remote: AnyDesk"
+          $remoteInfo = @(
+            'DAO REMOTE'
+            ''
+            'Remote: AnyDesk'
+            "AnyDesk ID: $anydeskId"
+            'Password: GitHub Secret ANYDESK_PASSWORD'
+            'IP: Dynamic GitHub-hosted runner IP'
+            'Domain: Not applicable'
+            ''
+            'Use the AnyDesk ID to connect.'
+          )
+
+          $remoteInfo |
+            Set-Content `
+              -Path (
+                Join-Path `
+                  $env:DAO_ROOT `
+                  'remote-info.txt'
+              ) `
+              -Encoding UTF8
+
+          Write-Host ''
+          Write-Host '======================================'
+          Write-Host 'DAO REMOTE DESKTOP'
+          Write-Host '======================================'
           Write-Host "AnyDesk ID: $anydeskId"
-          Write-Host "Password: GitHub Secret ANYDESK_PASSWORD"
-          Write-Host ""
-          Write-Host "Use this ID in AnyDesk to connect."
-          Write-Host "======================================"
-          Write-Host ""
-
-          # Save ID as artifact/log information.
-          # Password is intentionally NOT written.
-          Set-Content `
-            -Path "$env:DAO_ROOT\remote-info.txt" `
-            -Value @"
-DAO REMOTE
-
-Remote software:
-AnyDesk
-
-AnyDesk ID:
-$anydeskId
-
-Password:
-Stored in GitHub Secret ANYDESK_PASSWORD
-
-Domain:
-Not applicable for AnyDesk.
-
-IP:
-GitHub-hosted runner IP is dynamic.
-Use AnyDesk ID instead.
-"@
-
-
-      # ==========================================================
-      # 7. SHOW CONNECTION INFO
-      # ==========================================================
+          Write-Host 'Password: GitHub Secret ANYDESK_PASSWORD'
+          Write-Host '======================================'
 
       - name: Show connection information
         run: |
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "          DAO WINDOWS DESKTOP"
-          Write-Host "=============================================="
-          Write-Host ""
+          Write-Host ''
+          Write-Host '======================================'
+          Write-Host 'DAO WINDOWS DESKTOP'
+          Write-Host '======================================'
+          Write-Host ''
 
           Get-Content `
-            "$env:DAO_ROOT\remote-info.txt"
+            (Join-Path `
+              $env:DAO_ROOT `
+              'remote-info.txt')
 
-          Write-Host ""
-          Write-Host "Applications:"
-          Write-Host "  FileZilla"
-          Write-Host "  Notepad++"
-          Write-Host ""
+          Write-Host ''
+          Write-Host 'Applications:'
+          Write-Host '  FileZilla'
+          Write-Host '  Notepad++'
+          Write-Host ''
 
-          Write-Host "Runtime:"
-          Write-Host "  04:00:00"
-          Write-Host ""
+          Write-Host 'Runtime: 4 hours'
+          Write-Host 'Backup: 10 minutes before end'
+          Write-Host ''
 
-          Write-Host "Backup:"
-          Write-Host "  Previous backup restored if available"
-          Write-Host "  New backup at 03:50:00"
-          Write-Host ""
-
-
-      # ==========================================================
-      # 8. RUN FOR 3 HOURS 50 MINUTES
-      # ==========================================================
-
-      - name: Run desktop
+      - name: Keep desktop alive for 3 hours 50 minutes
         run: |
-
-          $ErrorActionPreference = "Continue"
-
-          $total = [int]$env:TOTAL_SECONDS
-          $backupTime = $total - [int]$env:BACKUP_SECONDS
-
+          $seconds = 13800
           $start = Get-Date
 
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "        DAO DESKTOP IS ACTIVE"
-          Write-Host "=============================================="
-          Write-Host ""
+          Write-Host ''
+          Write-Host 'Desktop is active.'
+          Write-Host 'Backup will start after 3 hours 50 minutes.'
+          Write-Host ''
 
-          Write-Host "Total runtime: 4 hours"
-          Write-Host "Backup starts after: 3 hours 50 minutes"
-          Write-Host ""
+          while (
+            ((Get-Date) - $start).TotalSeconds -lt $seconds
+          ) {
 
-          while ($true) {
+            $elapsed = [int](
+              ((Get-Date) - $start).TotalSeconds
+            )
 
-            $elapsed =
-              [int]((Get-Date) - $start).TotalSeconds
+            $remaining = $seconds - $elapsed
 
-            if ($elapsed -ge $backupTime) {
-              break
-            }
+            $h = [math]::Floor(
+              $remaining / 3600
+            )
 
-            $remaining =
-              $backupTime - $elapsed
+            $m = [math]::Floor(
+              ($remaining % 3600) / 60
+            )
 
-            $hours =
-              [math]::Floor($remaining / 3600)
-
-            $minutes =
-              [math]::Floor(($remaining % 3600) / 60)
-
-            $seconds =
-              $remaining % 60
+            $s = $remaining % 60
 
             Write-Host (
-              "Desktop active | " +
-              "Backup in {0:D2}:{1:D2}:{2:D2}" -f `
-              $hours,
-              $minutes,
-              $seconds
+              'Backup in {0:D2}:{1:D2}:{2:D2}' -f `
+              $h,
+              $m,
+              $s
             )
 
             Start-Sleep -Seconds 30
           }
 
-
-      # ==========================================================
-      # 9. BACKUP 10 MINUTES BEFORE END
-      # ==========================================================
-
-      - name: Create final backup
+      - name: Create backup
         if: always()
         run: |
+          $ErrorActionPreference = 'Continue'
 
-          $ErrorActionPreference = "Continue"
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "             DAO BACKUP"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          # Stop AnyDesk before backup
-          Get-Process `
-            -Name AnyDesk,anydesk `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-          Start-Sleep -Seconds 3
+          Write-Host ''
+          Write-Host '======================================'
+          Write-Host 'CREATING DAO BACKUP'
+          Write-Host '======================================'
 
           Remove-Item `
             $env:DAO_BACKUP `
@@ -616,10 +462,9 @@ Use AnyDesk ID instead.
             -Path $env:DAO_BACKUP `
             -Force | Out-Null
 
-          $temp =
-            Join-Path `
-              $env:TEMP `
-              "dao-backup"
+          $temp = Join-Path `
+            $env:TEMP `
+            'dao-backup'
 
           Remove-Item `
             $temp `
@@ -632,18 +477,19 @@ Use AnyDesk ID instead.
             -Path $temp `
             -Force | Out-Null
 
-          # Copy workspace
-          Copy-Item `
-            "$env:DAO_ROOT\*" `
-            $temp `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath $env:DAO_ROOT) {
 
-          $zip =
-            Join-Path `
-              $env:DAO_BACKUP `
-              "dao-state.zip"
+            Copy-Item `
+              "$env:DAO_ROOT\*" `
+              $temp `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          $zip = Join-Path `
+            $env:DAO_BACKUP `
+            'dao-state.zip'
 
           Compress-Archive `
             -Path "$temp\*" `
@@ -651,51 +497,32 @@ Use AnyDesk ID instead.
             -CompressionLevel Optimal `
             -Force
 
-          @"
-DAO WINDOWS DESKTOP BACKUP
+          $backupInfo = @(
+            'DAO Windows Desktop Backup'
+            "Repository: $env:GITHUB_REPOSITORY"
+            "Run ID: $env:GITHUB_RUN_ID"
+            "Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            'Runtime: 4 hours'
+            'Backup created 10 minutes before end.'
+          )
 
-Repository:
-$env:GITHUB_REPOSITORY
-
-Run:
-$env:GITHUB_RUN_ID
-
-Created:
-$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-
-Runtime:
-4 hours
-
-Backup:
-Created 10 minutes before shutdown.
-
-Applications:
-FileZilla
-Notepad++
-
-Remote:
-AnyDesk
-
-Secrets:
-Not included.
-"@ |
+          $backupInfo |
             Set-Content `
-              "$env:DAO_BACKUP\backup-info.txt" `
+              (
+                Join-Path `
+                  $env:DAO_BACKUP `
+                  'backup-info.txt'
+              ) `
               -Encoding UTF8
 
-          Write-Host "[OK] Backup created."
+          Write-Host '[OK] Backup created.'
 
           Get-ChildItem `
             $env:DAO_BACKUP `
             -Recurse `
             -File |
-            Select-Object Name,Length |
+            Select-Object Name, Length |
             Format-Table -AutoSize
-
-
-      # ==========================================================
-      # 10. UPLOAD BACKUP
-      # ==========================================================
 
       - name: Upload backup
         if: always()
@@ -707,37 +534,24 @@ Not included.
           retention-days: 30
           compression-level: 6
 
-
-      # ==========================================================
-      # 11. WAIT REMAINING 10 MINUTES
-      # ==========================================================
-
       - name: Final 10 minutes
         if: always()
         run: |
-
-          Write-Host ""
-          Write-Host "Backup completed."
-          Write-Host "Waiting for final 10 minutes..."
-          Write-Host ""
+          Write-Host ''
+          Write-Host 'Backup completed.'
+          Write-Host 'Waiting for final 10 minutes...'
+          Write-Host ''
 
           Start-Sleep -Seconds 600
-
-
-      # ==========================================================
-      # 12. FINISH
-      # ==========================================================
 
       - name: Finish
         if: always()
         run: |
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "        DAO WINDOWS DESKTOP END"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "Runtime: 4 hours"
-          Write-Host "Backup: completed"
-          Write-Host "Next run: previous backup will be restored."
-          Write-Host ""
+          Write-Host ''
+          Write-Host '======================================'
+          Write-Host 'DAO WINDOWS DESKTOP FINISHED'
+          Write-Host '======================================'
+          Write-Host ''
+          Write-Host 'Runtime: 4 hours'
+          Write-Host 'Backup: completed'
+          Write-Host 'Next run: previous backup will be restored.'
