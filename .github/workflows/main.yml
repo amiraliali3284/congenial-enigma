@@ -13,29 +13,20 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DAO_ROOT: D:\DAO-Workspace
-  DAO_TOOLS: D:\DAO-Tools
-  DAO_BACKUP: D:\DAO-Backup
-  DAO_RESTORE: D:\DAO-Restore
-  DAO_LOGS: D:\DAO-Logs
-
-  DAO_BACKUP_NAME: dao-windows-backup
-  DAO_LOGS_NAME: dao-windows-logs
+  DAO_ROOT: D:\DAO
+  DAO_BACKUP: D:\DAO-BACKUP
+  DAO_LOGS: D:\DAO-LOGS
+  DAO_TOOLS: D:\DAO-TOOLS
 
   VNC_PORT: "5900"
   NOVNC_PORT: "6080"
 
-  TOTAL_RUNTIME_SECONDS: "14400"
-  BACKUP_AFTER_SECONDS: "13800"
+  RUNTIME_SECONDS: "240"
 
 jobs:
-
   desktop:
-
     name: DAO Windows Desktop
-
     runs-on: windows-2025
-
     timeout-minutes: 240
 
     defaults:
@@ -44,96 +35,68 @@ jobs:
 
     steps:
 
-      # ============================================================
+      # ==========================================================
       # 1. CHECKOUT
-      # ============================================================
+      # ==========================================================
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v5
         with:
           persist-credentials: false
           fetch-depth: 1
 
-
-      # ============================================================
+      # ==========================================================
       # 2. INITIALIZE
-      # ============================================================
+      # ==========================================================
 
-      - name: Initialize DAO
+      - name: Initialize
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = "Stop"
 
-          $directories = @(
-            $env:DAO_ROOT
-            $env:DAO_TOOLS
-            $env:DAO_BACKUP
-            $env:DAO_RESTORE
-            $env:DAO_LOGS
-          )
+          New-Item -ItemType Directory -Path $env:DAO_ROOT -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:DAO_BACKUP -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:DAO_LOGS -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:DAO_TOOLS -Force | Out-Null
 
-          foreach ($directory in $directories) {
+          Write-Host "=========================================="
+          Write-Host "DAO WINDOWS DESKTOP"
+          Write-Host "=========================================="
+          Write-Host "Runner: $env:RUNNER_NAME"
+          Write-Host "OS: $env:RUNNER_OS"
+          Write-Host "Architecture: $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "Workspace: $env:DAO_ROOT"
 
-            New-Item `
-              -ItemType Directory `
-              -Path $directory `
-              -Force |
-              Out-Null
-          }
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "        DAO WINDOWS DESKTOP"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          Write-Host "Runner : $env:RUNNER_NAME"
-          Write-Host "OS     : $env:RUNNER_OS"
-          Write-Host "Root   : $env:DAO_ROOT"
-          Write-Host ""
-
-
-
-      # ============================================================
-      # 3. FIND PREVIOUS BACKUP
-      # ============================================================
+      # ==========================================================
+      # 3. RESTORE PREVIOUS BACKUP
+      # ==========================================================
 
       - name: Find previous backup
-        id: find_backup
+        id: backup
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_RUN: ${{ github.run_id }}
         run: |
-
           $ErrorActionPreference = "Continue"
 
           $found = $false
           $runId = ""
 
-          Write-Host "Searching for previous DAO backup..."
-
           try {
-
-            $runsJson = gh run list `
+            $runs = gh run list `
               --repo $env:REPOSITORY `
               --workflow windows-desktop.yml `
               --status completed `
-              --limit 50 `
-              --json databaseId,conclusion,createdAt
+              --limit 30 `
+              --json databaseId,conclusion
 
-            if (-not [string]::IsNullOrWhiteSpace($runsJson)) {
+            if ($LASTEXITCODE -eq 0 -and $runs) {
+              $items = $runs | ConvertFrom-Json
 
-              $runs = @(
-                $runsJson | ConvertFrom-Json
-              )
-
-              foreach ($run in $runs) {
-
-                if (
-                  [string]$run.databaseId -eq
-                  [string]$env:CURRENT_RUN_ID
-                ) {
+              foreach ($run in $items) {
+                if ([string]$run.databaseId -eq [string]$env:CURRENT_RUN) {
                   continue
                 }
 
@@ -141,281 +104,154 @@ jobs:
                   continue
                 }
 
-                Write-Host "Checking run $($run.databaseId)..."
-
                 try {
+                  $api = "/repos/$env:REPOSITORY/actions/runs/$($run.databaseId)/artifacts?per_page=100"
 
-                  $apiPath =
-                    "/repos/$env:REPOSITORY/actions/runs/$($run.databaseId)/artifacts?per_page=100"
-
-                  $artifactJson = gh api `
+                  $artifactData = gh api `
                     -H "Accept: application/vnd.github+json" `
-                    $apiPath
+                    $api
 
-                  if (
-                    [string]::IsNullOrWhiteSpace(
-                      $artifactJson
-                    )
-                  ) {
+                  if ($LASTEXITCODE -ne 0) {
                     continue
                   }
 
-                  $response =
-                    $artifactJson | ConvertFrom-Json
+                  $artifactResponse = $artifactData | ConvertFrom-Json
 
-                  $candidate = @(
-                    $response.artifacts |
+                  $artifact = @(
+                    $artifactResponse.artifacts |
                     Where-Object {
-                      $_.name -eq $env:DAO_BACKUP_NAME -and
+                      $_.name -eq "dao-windows-backup" -and
                       $_.expired -eq $false
                     }
-                  ) |
-                  Select-Object -First 1
+                  ) | Select-Object -First 1
 
-                  if ($null -ne $candidate) {
-
+                  if ($artifact) {
                     $found = $true
                     $runId = [string]$run.databaseId
 
-                    Write-Host ""
-                    Write-Host "[OK] Previous backup found."
-                    Write-Host "Run ID: $runId"
-                    Write-Host ""
+                    Write-Host "[OK] Backup found."
+                    Write-Host "Backup Run: $runId"
 
                     break
                   }
-
                 }
                 catch {
-
-                  Write-Warning `
-                    "Could not inspect run $($run.databaseId)."
+                  Write-Warning "Could not inspect run $($run.databaseId)"
                 }
               }
             }
-
           }
           catch {
-
-            Write-Warning `
-              "Backup search failed: $($_.Exception.Message)"
+            Write-Warning "Backup search failed."
           }
 
-          if (-not $found) {
-
-            Write-Host ""
-            Write-Host "[INFO] No previous backup found."
-            Write-Host ""
-          }
-
-          "found=$($found.ToString().ToLowerInvariant())" |
-            Out-File `
-              -FilePath $env:GITHUB_OUTPUT `
-              -Append `
-              -Encoding utf8
+          "found=$($found.ToString().ToLower())" |
+            Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
           "run_id=$runId" |
-            Out-File `
-              -FilePath $env:GITHUB_OUTPUT `
-              -Append `
-              -Encoding utf8
-
-
-
-      # ============================================================
-      # 4. DOWNLOAD PREVIOUS BACKUP
-      # ============================================================
+            Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Download previous backup
-        if: steps.find_backup.outputs.found == 'true'
+        if: steps.backup.outputs.found == 'true'
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          BACKUP_RUN_ID: ${{ steps.find_backup.outputs.run_id }}
+          BACKUP_RUN: ${{ steps.backup.outputs.run_id }}
         run: |
-
           $ErrorActionPreference = "Stop"
 
-          if (Test-Path $env:DAO_RESTORE) {
+          $restore = Join-Path $env:DAO_TOOLS "restore"
 
-            Remove-Item `
-              $env:DAO_RESTORE `
-              -Recurse `
-              -Force
+          if (Test-Path $restore) {
+            Remove-Item $restore -Recurse -Force
           }
 
-          New-Item `
-            -ItemType Directory `
-            -Path $env:DAO_RESTORE `
-            -Force |
-            Out-Null
+          New-Item -ItemType Directory -Path $restore -Force | Out-Null
 
-          Write-Host "Downloading previous DAO backup..."
+          Write-Host "Downloading previous backup..."
 
           gh run download `
-            $env:BACKUP_RUN_ID `
+            $env:BACKUP_RUN `
             --repo $env:REPOSITORY `
-            --name $env:DAO_BACKUP_NAME `
-            --dir $env:DAO_RESTORE
+            --name dao-windows-backup `
+            --dir $restore
 
           if ($LASTEXITCODE -ne 0) {
-
-            throw "Previous backup download failed."
+            throw "Backup download failed."
           }
 
-          $backupFiles = @(
-            Get-ChildItem `
-              $env:DAO_RESTORE `
-              -Recurse `
-              -File
-          )
-
-          Write-Host ""
-          Write-Host "[OK] Backup downloaded."
-          Write-Host "Files: $($backupFiles.Count)"
-          Write-Host ""
-
-
-
-      # ============================================================
-      # 5. RESTORE
-      # ============================================================
-
-      - name: Restore DAO workspace
-        if: always()
-        run: |
-
-          $ErrorActionPreference = "Continue"
-
-          $stateZip = Get-ChildItem `
-            -Path $env:DAO_RESTORE `
+          $zip = Get-ChildItem `
+            -Path $restore `
             -Filter "dao-state.zip" `
             -Recurse `
             -File `
             -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
-          if ($null -eq $stateZip) {
-
-            Write-Host "[INFO] No previous state found."
+          if (-not $zip) {
+            Write-Host "No dao-state.zip found."
             exit 0
           }
 
-          Write-Host "Restoring DAO workspace..."
+          $extract = Join-Path $env:DAO_TOOLS "restore-extract"
 
-          $tempRestore =
-            Join-Path `
-              $env:DAO_TOOLS `
-              "restore-temp"
-
-          if (Test-Path $tempRestore) {
-
-            Remove-Item `
-              $tempRestore `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
           }
 
-          New-Item `
-            -ItemType Directory `
-            -Path $tempRestore `
-            -Force |
-            Out-Null
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
 
-          try {
+          Expand-Archive `
+            -Path $zip.FullName `
+            -DestinationPath $extract `
+            -Force
 
-            Expand-Archive `
-              -LiteralPath $stateZip.FullName `
-              -DestinationPath $tempRestore `
-              -Force
+          $items = Get-ChildItem `
+            -Path $extract `
+            -Force `
+            -ErrorAction SilentlyContinue
 
-            $items = Get-ChildItem `
-              -Path $tempRestore `
-              -Force
+          foreach ($item in $items) {
+            $destination = Join-Path $env:DAO_ROOT $item.Name
 
-            foreach ($item in $items) {
-
-              $destination =
-                Join-Path `
-                  $env:DAO_ROOT `
-                  $item.Name
-
-              if (Test-Path $destination) {
-
-                Remove-Item `
-                  $destination `
-                  -Recurse `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-              }
-
-              Move-Item `
-                $item.FullName `
-                $destination `
-                -Force
+            if (Test-Path $destination) {
+              Remove-Item $destination -Recurse -Force
             }
 
-            Write-Host "[OK] DAO workspace restored."
-
-          }
-          catch {
-
-            Write-Warning `
-              "Restore failed: $($_.Exception.Message)"
+            Move-Item `
+              -Path $item.FullName `
+              -Destination $destination `
+              -Force
           }
 
+          Write-Host "[OK] Previous DAO state restored."
 
-
-      # ============================================================
-      # 6. INSTALL FILEZILLA + NOTEPAD++
-      # ============================================================
+      # ==========================================================
+      # 4. INSTALL FILEZILLA + NOTEPAD++
+      # ==========================================================
 
       - name: Install applications
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = "Continue"
 
+          Write-Host "Checking winget..."
+
+          winget --version
+
           Write-Host ""
-          Write-Host "Installing DAO applications..."
-          Write-Host ""
-
-          try {
-
-            winget --version
-
-          }
-          catch {
-
-            throw "WinGet is unavailable."
-          }
-
-
-          # ----------------------------------------------------------
-          # FileZilla
-          # ----------------------------------------------------------
-
           Write-Host "Installing FileZilla..."
 
           winget install `
-            --id FileZilla.Client `
+            --id FileZilla.FileZilla `
             --exact `
             --silent `
             --accept-package-agreements `
             --accept-source-agreements `
             --disable-interactivity
 
-          if ($LASTEXITCODE -ne 0) {
-
-            Write-Warning `
-              "FileZilla installation returned $LASTEXITCODE."
-          }
-
-
-          # ----------------------------------------------------------
-          # Notepad++
-          # ----------------------------------------------------------
-
+          Write-Host ""
           Write-Host "Installing Notepad++..."
 
           winget install `
@@ -426,17 +262,7 @@ jobs:
             --accept-source-agreements `
             --disable-interactivity
 
-          if ($LASTEXITCODE -ne 0) {
-
-            Write-Warning `
-              "Notepad++ installation returned $LASTEXITCODE."
-          }
-
-
-          # ----------------------------------------------------------
-          # TightVNC
-          # ----------------------------------------------------------
-
+          Write-Host ""
           Write-Host "Installing TightVNC..."
 
           winget install `
@@ -447,560 +273,251 @@ jobs:
             --accept-source-agreements `
             --disable-interactivity
 
-          if ($LASTEXITCODE -ne 0) {
-
-            throw "TightVNC installation failed."
-          }
-
-
-          # ----------------------------------------------------------
-          # Cloudflare
-          # ----------------------------------------------------------
-
-          Write-Host "Installing cloudflared..."
-
-          winget install `
-            --id Cloudflare.cloudflared `
-            --exact `
-            --silent `
-            --accept-package-agreements `
-            --accept-source-agreements `
-            --disable-interactivity
-
-          if ($LASTEXITCODE -ne 0) {
-
-            throw "cloudflared installation failed."
-          }
-
-
-          Write-Host ""
-          Write-Host "[OK] Application installation finished."
-          Write-Host ""
-
-
-
-      # ============================================================
-      # 7. DOWNLOAD NOVNC
-      # ============================================================
+      # ==========================================================
+      # 5. DOWNLOAD NOVNC
+      # ==========================================================
 
       - name: Prepare noVNC
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = "Stop"
 
-          $applications =
-            Join-Path `
-              $env:DAO_ROOT `
-              "Applications"
+          $novnc = Join-Path $env:DAO_ROOT "noVNC"
+          $zip = Join-Path $env:DAO_TOOLS "novnc.zip"
+          $extract = Join-Path $env:DAO_TOOLS "novnc-extract"
 
-          $novnc =
-            Join-Path `
-              $applications `
-              "noVNC"
-
-          New-Item `
-            -ItemType Directory `
-            -Path $applications `
-            -Force |
-            Out-Null
-
-
-          if (
-            Test-Path `
-              (Join-Path $novnc "vnc.html")
-          ) {
-
-            Write-Host "[OK] noVNC already exists."
-            exit 0
+          if (Test-Path $novnc) {
+            Remove-Item $novnc -Recurse -Force
           }
 
-
-          $zip =
-            Join-Path `
-              $env:DAO_TOOLS `
-              "novnc.zip"
-
-          $extract =
-            Join-Path `
-              $env:DAO_TOOLS `
-              "novnc-extract"
-
-
           if (Test-Path $zip) {
-
-            Remove-Item `
-              $zip `
-              -Force
+            Remove-Item $zip -Force
           }
 
           if (Test-Path $extract) {
-
-            Remove-Item `
-              $extract `
-              -Recurse `
-              -Force
+            Remove-Item $extract -Recurse -Force
           }
 
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
 
           Write-Host "Downloading noVNC..."
-
 
           Invoke-WebRequest `
             -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.zip" `
             -OutFile $zip `
             -UseBasicParsing
 
-
           Expand-Archive `
-            -LiteralPath $zip `
+            -Path $zip `
             -DestinationPath $extract `
             -Force
 
-
-          $source =
-            Join-Path `
-              $extract `
-              "noVNC-1.7.0"
-
+          $source = Join-Path $extract "noVNC-1.7.0"
 
           if (-not (Test-Path $source)) {
-
-            throw "noVNC directory not found."
+            throw "noVNC extraction failed."
           }
-
-
-          if (Test-Path $novnc) {
-
-            Remove-Item `
-              $novnc `
-              -Recurse `
-              -Force
-          }
-
 
           Move-Item `
-            $source `
-            $novnc `
+            -Path $source `
+            -Destination $novnc `
             -Force
 
-
-          if (
-            -not (
-              Test-Path `
-                (Join-Path $novnc "vnc.html")
-            )
-          ) {
-
-            throw "vnc.html was not found."
+          if (-not (Test-Path (Join-Path $novnc "vnc.html"))) {
+            throw "vnc.html not found."
           }
-
 
           Write-Host "[OK] noVNC ready."
 
+      # ==========================================================
+      # 6. CONFIGURE VNC
+      # ==========================================================
 
-
-      # ============================================================
-      # 8. START REMOTE DESKTOP
-      # ============================================================
-
-      - name: Start Remote Desktop
+      - name: Configure TightVNC
+        shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-
           $ErrorActionPreference = "Stop"
 
-
-          function Find-Executable {
-
-            param(
-              [string[]]$Names,
-              [string[]]$Paths
-            )
-
-            foreach ($name in $Names) {
-
-              $command =
-                Get-Command `
-                  $name `
-                  -ErrorAction SilentlyContinue
-
-              if ($command) {
-
-                return $command.Source
-              }
-            }
-
-
-            foreach ($path in $Paths) {
-
-              if (Test-Path $path) {
-
-                return $path
-              }
-            }
-
-
-            return $null
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            throw "Create GitHub Secret named VNC_PASSWORD first."
           }
 
+          $vnc = $null
 
-          function Test-Port {
+          $paths = @(
+            "$env:ProgramFiles\TightVNC\tvnserver.exe",
+            "$env:ProgramFiles\TightVNC\winvnc.exe",
+            "${env:ProgramFiles(x86)}\TightVNC\tvnserver.exe",
+            "${env:ProgramFiles(x86)}\TightVNC\winvnc.exe"
+          )
 
-            param(
-              [int]$Port
-            )
-
-            try {
-
-              $result =
-                Get-NetTCPConnection `
-                  -LocalPort $Port `
-                  -State Listen `
-                  -ErrorAction SilentlyContinue
-
-              return ($null -ne $result)
-
-            }
-            catch {
-
-              return $false
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              $vnc = $path
+              break
             }
           }
-
-
-          function Wait-Port {
-
-            param(
-              [int]$Port,
-              [int]$Seconds = 30
-            )
-
-            $deadline =
-              (Get-Date).AddSeconds($Seconds)
-
-
-            while ((Get-Date) -lt $deadline) {
-
-              if (Test-Port $Port) {
-
-                return $true
-              }
-
-              Start-Sleep -Seconds 1
-            }
-
-
-            return $false
-          }
-
-
-          # ----------------------------------------------------------
-          # Find TightVNC
-          # ----------------------------------------------------------
-
-          $vnc =
-            Find-Executable `
-              -Names @(
-                "tvnserver.exe",
-                "winvnc.exe"
-              ) `
-              -Paths @(
-                "$env:ProgramFiles\TightVNC\tvnserver.exe",
-                "$env:ProgramFiles\TightVNC\winvnc.exe",
-                "${env:ProgramFiles(x86)}\TightVNC\tvnserver.exe",
-                "${env:ProgramFiles(x86)}\TightVNC\winvnc.exe"
-              )
-
 
           if (-not $vnc) {
-
             throw "TightVNC executable not found."
           }
 
-
-          Write-Host "TightVNC: $vnc"
-
-
-          # ----------------------------------------------------------
-          # Configure TightVNC
-          # ----------------------------------------------------------
-
-          $regPath =
-            "HKLM:\SOFTWARE\TightVNC\Server"
-
+          $reg = "HKLM:\SOFTWARE\TightVNC\Server"
 
           New-Item `
-            -Path $regPath `
+            -Path $reg `
             -Force `
             -ErrorAction SilentlyContinue |
             Out-Null
 
-
-          $password =
-            [string]$env:VNC_PASSWORD
-
-
-          if ([string]::IsNullOrWhiteSpace($password)) {
-
-            throw "VNC_PASSWORD secret is missing."
-          }
-
+          $password = $env:VNC_PASSWORD
 
           if ($password.Length -gt 8) {
-
-            $password =
-              $password.Substring(0,8)
+            $password = $password.Substring(0, 8)
           }
 
-
           while ($password.Length -lt 8) {
-
             $password += [char]0
           }
 
+          $key = [byte[]](
+            0x17,
+            0x52,
+            0x6B,
+            0x8E,
+            0x17,
+            0x52,
+            0x6B,
+            0x8E
+          )
+
+          $plain = [System.Text.Encoding]::ASCII.GetBytes($password)
+
+          $des = [System.Security.Cryptography.DES]::Create()
 
           try {
+            $des.Mode = [System.Security.Cryptography.CipherMode]::ECB
+            $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+            $des.Key = $key
 
-            $key =
-              [byte[]](
-                0x17,
-                0x52,
-                0x6B,
-                0x8E,
-                0x17,
-                0x52,
-                0x6B,
-                0x8E
-              )
-
-
-            $plain =
-              [System.Text.Encoding]::ASCII.GetBytes(
-                $password
-              )
-
-
-            $des =
-              [System.Security.Cryptography.DES]::Create()
-
-
-            try {
-
-              $des.Mode =
-                [System.Security.Cryptography.CipherMode]::ECB
-
-              $des.Padding =
-                [System.Security.Cryptography.PaddingMode]::None
-
-              $des.Key = $key
-
-
-              $encrypted =
-                $des.CreateEncryptor().TransformFinalBlock(
-                  $plain,
-                  0,
-                  8
-                )
-
-            }
-            finally {
-
-              $des.Dispose()
-            }
-
-
-            New-ItemProperty `
-              -Path $regPath `
-              -Name "Password" `
-              -PropertyType Binary `
-              -Value $encrypted `
-              -Force |
-              Out-Null
-
-
-            New-ItemProperty `
-              -Path $regPath `
-              -Name "UseVncAuthentication" `
-              -PropertyType DWord `
-              -Value 1 `
-              -Force |
-              Out-Null
-
-
-            New-ItemProperty `
-              -Path $regPath `
-              -Name "RfbPort" `
-              -PropertyType DWord `
-              -Value 5900 `
-              -Force |
-              Out-Null
-
-
-            New-ItemProperty `
-              -Path $regPath `
-              -Name "LoopbackOnly" `
-              -PropertyType DWord `
-              -Value 0 `
-              -Force |
-              Out-Null
-
-
-            Write-Host "[OK] VNC configured."
-
+            $encrypted = $des.CreateEncryptor().TransformFinalBlock(
+              $plain,
+              0,
+              8
+            )
           }
-          catch {
-
-            throw `
-              "Could not configure TightVNC: $($_.Exception.Message)"
+          finally {
+            $des.Dispose()
           }
 
+          New-ItemProperty `
+            -Path $reg `
+            -Name Password `
+            -PropertyType Binary `
+            -Value $encrypted `
+            -Force |
+            Out-Null
 
-          # ----------------------------------------------------------
-          # Start VNC
-          # ----------------------------------------------------------
+          New-ItemProperty `
+            -Path $reg `
+            -Name UseVncAuthentication `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force |
+            Out-Null
 
-          try {
+          New-ItemProperty `
+            -Path $reg `
+            -Name RfbPort `
+            -PropertyType DWord `
+            -Value 5900 `
+            -Force |
+            Out-Null
 
-            & $vnc `
-              -stop `
-              -silent `
-              2>&1 |
-              Out-File `
-                (Join-Path $env:DAO_LOGS "vnc.log") `
-                -Append
+          New-ItemProperty `
+            -Path $reg `
+            -Name LoopbackOnly `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force |
+            Out-Null
 
-          }
-          catch {
-          }
-
+          & $vnc -stop -silent 2>&1 | Out-Null
 
           Start-Sleep -Seconds 2
 
-
-          & $vnc `
-            -start `
-            -silent `
-            2>&1 |
+          & $vnc -start -silent 2>&1 |
             Out-File `
               (Join-Path $env:DAO_LOGS "vnc.log") `
               -Append
 
+          Start-Sleep -Seconds 5
 
-          if (-not (Wait-Port 5900 30)) {
+          Write-Host "[OK] TightVNC started."
 
-            throw "VNC did not start on port 5900."
-          }
+      # ==========================================================
+      # 7. INSTALL WEBSOCKIFY
+      # ==========================================================
 
+      - name: Install websockify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          Write-Host "[OK] VNC running on TCP 5900."
+          python --version
 
-
-          # ----------------------------------------------------------
-          # Install websockify
-          # ----------------------------------------------------------
-
-          $python =
-            Find-Executable `
-              -Names @(
-                "python.exe",
-                "py.exe"
-              ) `
-              -Paths @()
-
-
-          if (-not $python) {
-
-            throw "Python was not found."
-          }
-
-
-          & $python `
-            -m pip `
-            install `
+          python -m pip install `
             --disable-pip-version-check `
             --no-input `
             --upgrade `
             websockify
 
-
           if ($LASTEXITCODE -ne 0) {
-
             throw "websockify installation failed."
           }
 
+          Write-Host "[OK] websockify installed."
 
-          $websockify =
-            Find-Executable `
-              -Names @(
-                "websockify.exe",
-                "websockify"
-              ) `
-              -Paths @()
+      # ==========================================================
+      # 8. START REMOTE DESKTOP
+      # ==========================================================
 
+      - name: Start Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          if (-not $websockify) {
+          $novnc = Join-Path $env:DAO_ROOT "noVNC"
 
-            $scripts =
-              & $python `
-                -c `
-                "import sysconfig; print(sysconfig.get_path('scripts'))"
+          $webLog = Join-Path $env:DAO_LOGS "websockify.log"
+          $webError = Join-Path $env:DAO_LOGS "websockify-error.log"
 
+          $cloudLog = Join-Path $env:DAO_LOGS "cloudflare.log"
+          $cloudError = Join-Path $env:DAO_LOGS "cloudflare-error.log"
 
-            if ($scripts) {
+          Write-Host "Starting websockify..."
 
-              $candidate =
-                Join-Path `
-                  ([string]$scripts).Trim() `
-                  "websockify.exe"
+          $websockify = $null
 
+          $commands = @(
+            "websockify.exe",
+            "websockify"
+          )
 
-              if (Test-Path $candidate) {
+          foreach ($name in $commands) {
+            $command = Get-Command $name -ErrorAction SilentlyContinue
 
-                $websockify = $candidate
-              }
+            if ($command) {
+              $websockify = $command.Source
+              break
             }
           }
 
-
           if (-not $websockify) {
-
             throw "websockify executable not found."
           }
-
-
-          Write-Host "websockify: $websockify"
-
-
-          # ----------------------------------------------------------
-          # Start websockify
-          # ----------------------------------------------------------
-
-          $novnc =
-            Join-Path `
-              $env:DAO_ROOT `
-              "Applications\noVNC"
-
-
-          $webLog =
-            Join-Path `
-              $env:DAO_LOGS `
-              "websockify.log"
-
-
-          $webError =
-            Join-Path `
-              $env:DAO_LOGS `
-              "websockify-error.log"
-
-
-          Get-Process `
-            -Name websockify `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-              -Force `
-              -ErrorAction SilentlyContinue
-
 
           Start-Process `
             -FilePath $websockify `
@@ -1015,427 +532,234 @@ jobs:
             -RedirectStandardError $webError `
             -WindowStyle Hidden
 
+          Start-Sleep -Seconds 8
 
-          if (-not (Wait-Port 6080 30)) {
-
-            if (Test-Path $webError) {
-
-              Get-Content `
-                $webError `
-                -Tail 50
-            }
-
-            throw "noVNC websockify did not start."
-          }
-
-
-          Write-Host "[OK] noVNC running on TCP 6080."
-
-
-          # ----------------------------------------------------------
-          # Cloudflare Tunnel
-          # ----------------------------------------------------------
-
-          $cloudflared =
-            Find-Executable `
-              -Names @(
-                "cloudflared.exe"
-              ) `
-              -Paths @(
-                "$env:ProgramFiles\cloudflared\cloudflared.exe",
-                "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe"
-              )
-
-
-          if (-not $cloudflared) {
-
-            throw "cloudflared executable not found."
-          }
-
-
-          $cloudLog =
-            Join-Path `
-              $env:DAO_LOGS `
-              "cloudflared.log"
-
-
-          $cloudError =
-            Join-Path `
-              $env:DAO_LOGS `
-              "cloudflared-error.log"
-
-
-          $urlFile =
-            Join-Path `
-              $env:DAO_LOGS `
-              "remote-url.txt"
-
-
-          Remove-Item `
-            $urlFile `
-            -Force `
+          $webPort = Get-NetTCPConnection `
+            -LocalPort 6080 `
+            -State Listen `
             -ErrorAction SilentlyContinue
 
+          if (-not $webPort) {
+            Write-Host "websockify error log:"
 
-          Get-Process `
-            -Name cloudflared `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-              -Force `
-              -ErrorAction SilentlyContinue
+            if (Test-Path $webError) {
+              Get-Content $webError -Tail 100
+            }
 
+            throw "Port 6080 is not listening."
+          }
 
-          $cloudProcess =
-            Start-Process `
-              -FilePath $cloudflared `
-              -ArgumentList @(
-                "tunnel",
-                "--no-autoupdate",
-                "--url",
-                "http://127.0.0.1:6080"
-              ) `
-              -RedirectStandardOutput $cloudLog `
-              -RedirectStandardError $cloudError `
-              -WindowStyle Hidden `
-              -PassThru
+          Write-Host "[OK] noVNC running on port 6080."
 
+          # --------------------------------------------------------
+          # Install cloudflared if required
+          # --------------------------------------------------------
 
-          Write-Host ""
-          Write-Host "Waiting for Cloudflare URL..."
+          $cloudflared = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
 
+          if (-not $cloudflared) {
+            $cloudflaredPath = Join-Path $env:DAO_TOOLS "cloudflared.exe"
+
+            Write-Host "Downloading cloudflared..."
+
+            Invoke-WebRequest `
+              -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+              -OutFile $cloudflaredPath `
+              -UseBasicParsing
+
+            $cloudflared = Get-Item $cloudflaredPath
+          }
+
+          Write-Host "Starting Cloudflare Quick Tunnel..."
+
+          Start-Process `
+            -FilePath $cloudflared.Source `
+            -ArgumentList @(
+              "tunnel",
+              "--no-autoupdate",
+              "--url",
+              "http://127.0.0.1:6080"
+            ) `
+            -RedirectStandardOutput $cloudLog `
+            -RedirectStandardError $cloudError `
+            -WindowStyle Hidden
 
           $publicUrl = $null
-
-
-          $deadline =
-            (Get-Date).AddSeconds(120)
-
+          $deadline = (Get-Date).AddSeconds(120)
 
           while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
 
-            $output = ""
-
+            $text = ""
 
             if (Test-Path $cloudLog) {
-
-              $output +=
-                Get-Content `
-                  $cloudLog `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
+              $text += "`n" + (Get-Content $cloudLog -Raw)
             }
-
 
             if (Test-Path $cloudError) {
-
-              $output +=
-                "`n" +
-                (
-                  Get-Content `
-                    $cloudError `
-                    -Raw `
-                    -ErrorAction SilentlyContinue
-                )
+              $text += "`n" + (Get-Content $cloudError -Raw)
             }
 
-
-            $match =
-              [regex]::Match(
-                $output,
-                "https://[a-zA-Z0-9-]+\.trycloudflare\.com"
-              )
-
+            $match = [regex]::Match(
+              $text,
+              "https://[a-zA-Z0-9-]+\.trycloudflare\.com"
+            )
 
             if ($match.Success) {
+              $publicUrl = $match.Value
+              break
+            }
+          }
 
-              $publicUrl =
-                "$($match.Value)/vnc.html"
+          if (-not $publicUrl) {
+            Write-Host "Cloudflare output:"
 
+            if (Test-Path $cloudLog) {
+              Get-Content $cloudLog -Tail 100
+            }
+
+            if (Test-Path $cloudError) {
+              Get-Content $cloudError -Tail 100
+            }
+
+            throw "Cloudflare tunnel URL was not found."
+          }
+
+          $remoteUrl = "$publicUrl/vnc.html"
+
+          Set-Content `
+            -Path (Join-Path $env:DAO_LOGS "remote-url.txt") `
+            -Value $remoteUrl `
+            -NoNewline
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "REMOTE DESKTOP READY"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "Domain:"
+          Write-Host $publicUrl
+          Write-Host ""
+          Write-Host "Remote URL:"
+          Write-Host $remoteUrl
+          Write-Host ""
+          Write-Host "VNC IP:"
+          Write-Host "127.0.0.1:5900"
+          Write-Host ""
+          Write-Host "VNC Username:"
+          Write-Host "Not required"
+          Write-Host ""
+          Write-Host "VNC Password:"
+          Write-Host "GitHub Secret: VNC_PASSWORD"
+          Write-Host ""
+          Write-Host "=========================================="
+
+      # ==========================================================
+      # 9. SHOW CONNECTION INFORMATION
+      # ==========================================================
+
+      - name: Show connection information
+        shell: pwsh
+        run: |
+          $urlFile = Join-Path $env:DAO_LOGS "remote-url.txt"
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "DAO REMOTE CONNECTION"
+          Write-Host "=========================================="
+
+          if (Test-Path $urlFile) {
+            $url = Get-Content $urlFile -Raw
+            Write-Host "Domain:"
+            Write-Host $url
+          }
+
+          Write-Host ""
+          Write-Host "Username: Not required"
+          Write-Host "Password: GitHub Secret VNC_PASSWORD"
+          Write-Host ""
+          Write-Host "FileZilla: Installed"
+          Write-Host "Notepad++: Installed"
+          Write-Host "=========================================="
+
+      # ==========================================================
+      # 10. RUN DESKTOP
+      # ==========================================================
+
+      - name: Run DAO Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $totalSeconds = 240
+          $backupAt = 230
+
+          $start = Get-Date
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "DAO DESKTOP ACTIVE"
+          Write-Host "Runtime: 4 hours"
+          Write-Host "Backup: 10 minutes before shutdown"
+          Write-Host "=========================================="
+
+          while ($true) {
+            $elapsed = [int]((Get-Date - $start).TotalSeconds)
+
+            if ($elapsed -ge $totalSeconds) {
               break
             }
 
-
-            Start-Sleep -Seconds 2
-          }
-
-
-          if (
-            [string]::IsNullOrWhiteSpace($publicUrl)
-          ) {
-
-            Write-Host "----- cloudflared log -----"
-
-            if (Test-Path $cloudLog) {
-
-              Get-Content `
-                $cloudLog `
-                -Tail 100
-            }
-
-
-            Write-Host "----- cloudflared error -----"
-
-            if (Test-Path $cloudError) {
-
-              Get-Content `
-                $cloudError `
-                -Tail 100
-            }
-
-
-            throw `
-              "Cloudflare public URL was not detected."
-          }
-
-
-          Set-Content `
-            -Path $urlFile `
-            -Value $publicUrl `
-            -NoNewline `
-            -Encoding UTF8
-
-
-          # ----------------------------------------------------------
-          # Connection information
-          # ----------------------------------------------------------
-
-          $connectionFile =
-            Join-Path `
-              $env:DAO_LOGS `
-              "connection-info.txt"
-
-
-          $username =
-            $env:USERNAME
-
-
-          @"
-DAO WINDOWS DESKTOP
-===================
-
-REMOTE
-------
-
-Domain:
-$publicUrl
-
-Public URL:
-$publicUrl
-
-Internal IP:
-127.0.0.1
-
-VNC Port:
-5900
-
-Web Port:
-6080
-
-Windows Username:
-$username
-
-Remote Username:
-N/A (VNC)
-
-Remote Password:
-VNC_PASSWORD GitHub Secret
-
-IMPORTANT:
-The VNC password is not written to this file.
-
-Applications:
-FileZilla
-Notepad++
-
-Runtime:
-4 hours
-
-Backup:
-10 minutes before shutdown
-
-===================
-"@ |
-            Set-Content `
-              -Path $connectionFile `
-              -Encoding UTF8
-
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "        DAO REMOTE DESKTOP READY"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          Write-Host "DOMAIN:"
-          Write-Host $publicUrl
-          Write-Host ""
-
-          Write-Host "INTERNAL IP:"
-          Write-Host "127.0.0.1"
-          Write-Host ""
-
-          Write-Host "WINDOWS USER:"
-          Write-Host $username
-          Write-Host ""
-
-          Write-Host "REMOTE USER:"
-          Write-Host "N/A - VNC"
-          Write-Host ""
-
-          Write-Host "PASSWORD:"
-          Write-Host "GitHub Secret: VNC_PASSWORD"
-          Write-Host ""
-
-          Write-Host "=============================================="
-          Write-Host ""
-
-
-
-      # ============================================================
-      # 9. SHOW CONNECTION INFO
-      # ============================================================
-
-      - name: Show remote connection
-        run: |
-
-          $file =
-            Join-Path `
-              $env:DAO_LOGS `
-              "connection-info.txt"
-
-
-          if (Test-Path $file) {
-
-            Write-Host ""
-
-            Get-Content $file
-
-            Write-Host ""
-          }
-
-
-
-      # ============================================================
-      # 10. RUN FOR 3 HOURS 50 MINUTES
-      # ============================================================
-
-      - name: Run desktop
-        run: |
-
-          $runtime =
-            [int]$env:BACKUP_AFTER_SECONDS
-
-
-          $started =
-            Get-Date
-
-
-          $deadline =
-            $started.AddSeconds($runtime)
-
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "       DAO DESKTOP IS RUNNING"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "Desktop runtime before backup: 03:50:00"
-          Write-Host "Backup will start at 03:50:00"
-          Write-Host "Shutdown target: 04:00:00"
-          Write-Host ""
-
-
-          while ((Get-Date) -lt $deadline) {
-
-            $elapsed =
-              [int](
-                (
-                  (Get-Date) - $started
-                ).TotalSeconds
-              )
-
-
-            $remaining =
-              [math]::Max(
-                0,
-                $runtime - $elapsed
-              )
-
-
-            $minutes =
-              [math]::Floor(
-                $remaining / 60
-              )
-
-
-            $seconds =
-              $remaining % 60
-
-
-            Write-Host `
-              "Desktop active | Remaining: $minutes min $seconds sec"
-
+            $remaining = $totalSeconds - $elapsed
+
+            $hours = [math]::Floor($elapsed / 3600)
+            $minutes = [math]::Floor(($elapsed % 3600) / 60)
+            $seconds = $elapsed % 60
+
+            $leftHours = [math]::Floor($remaining / 3600)
+            $leftMinutes = [math]::Floor(($remaining % 3600) / 60)
+            $leftSeconds = $remaining % 60
+
+            Write-Host (
+              "Runtime {0:D2}:{1:D2}:{2:D2} | Remaining {3:D2}:{4:D2}:{5:D2}" -f `
+              $hours,
+              $minutes,
+              $seconds,
+              $leftHours,
+              $leftMinutes,
+              $leftSeconds
+            )
 
             Start-Sleep -Seconds 15
           }
 
+          Write-Host "Runtime finished."
 
-          Write-Host ""
-          Write-Host "03:50:00 reached."
-          Write-Host "Starting backup..."
+      # ==========================================================
+      # 11. BACKUP
+      # ==========================================================
 
-
-
-      # ============================================================
-      # 11. CREATE BACKUP AT 03:50
-      # ============================================================
-
-      - name: Create DAO backup
-        id: create_backup
+      - name: Create final backup
         if: always()
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = "Continue"
 
           Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "             DAO BACKUP"
-          Write-Host "=============================================="
-          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "CREATING DAO BACKUP"
+          Write-Host "=========================================="
 
-
-          if (Test-Path $env:DAO_BACKUP) {
-
-            Remove-Item `
-              $env:DAO_BACKUP `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-          }
-
-
-          New-Item `
-            -ItemType Directory `
-            -Path $env:DAO_BACKUP `
-            -Force |
-            Out-Null
-
-
-          $temp =
-            Join-Path `
-              $env:DAO_TOOLS `
-              "backup-state"
-
+          $temp = Join-Path $env:DAO_TOOLS "backup-state"
+          $zip = Join-Path $env:DAO_BACKUP "dao-state.zip"
 
           if (Test-Path $temp) {
-
-            Remove-Item `
-              $temp `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
+            Remove-Item $temp -Recurse -Force
           }
 
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
           New-Item `
             -ItemType Directory `
@@ -1443,90 +767,33 @@ Backup:
             -Force |
             Out-Null
 
-
-          # ----------------------------------------------------------
-          # Copy workspace
-          # Applications folder is excluded.
-          # ----------------------------------------------------------
-
           if (Test-Path $env:DAO_ROOT) {
-
             Get-ChildItem `
               -Path $env:DAO_ROOT `
               -Force `
               -ErrorAction SilentlyContinue |
               Where-Object {
-                $_.Name -ne "Applications"
+                $_.Name -ne "noVNC"
               } |
               ForEach-Object {
-
-                $destination =
-                  Join-Path `
-                    $temp `
-                    $_.Name
-
-
                 try {
-
                   Copy-Item `
-                    -LiteralPath $_.FullName `
-                    -Destination $destination `
+                    -Path $_.FullName `
+                    -Destination (Join-Path $temp $_.Name) `
                     -Recurse `
-                    -Force `
-                    -ErrorAction Stop
-
+                    -Force
                 }
                 catch {
-
-                  Write-Warning `
-                    "Backup failed for $($_.Name)"
+                  Write-Warning "Could not backup $($_.Name)"
                 }
               }
           }
 
-
-          # ----------------------------------------------------------
-          # ZIP
-          # ----------------------------------------------------------
-
-          $zip =
-            Join-Path `
-              $env:DAO_BACKUP `
-              "dao-state.zip"
-
-
-          try {
-
-            Compress-Archive `
-              -Path (
-                Join-Path `
-                  $temp `
-                  "*"
-              ) `
-              -DestinationPath $zip `
-              -CompressionLevel Optimal `
-              -Force
-
-
-            Write-Host "[OK] dao-state.zip created."
-
-          }
-          catch {
-
-            Write-Warning `
-              "Could not create ZIP."
-          }
-
-
-          # ----------------------------------------------------------
-          # Metadata
-          # ----------------------------------------------------------
-
-          $metadata =
-            Join-Path `
-              $env:DAO_BACKUP `
-              "backup-info.txt"
-
+          Compress-Archive `
+            -Path (Join-Path $temp "*") `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal `
+            -Force
 
           @"
 DAO WINDOWS DESKTOP BACKUP
@@ -1538,120 +805,49 @@ Run:
 $env:GITHUB_RUN_ID
 
 Created:
-$(Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
-
-Backup time:
-03:50:00
-
-Shutdown:
-04:00:00
+$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 
 Applications:
-FileZilla and Notepad++ are installed again on each run.
+FileZilla
+Notepad++
 
-Applications folder:
-Excluded.
+Remote:
+TightVNC + noVNC
 
 Secrets:
-Not stored.
-
-GitHub token:
-Not stored.
+Not stored
 "@ |
             Set-Content `
-              -Path $metadata `
+              -Path (Join-Path $env:DAO_BACKUP "backup-info.txt") `
               -Encoding UTF8
 
+          Write-Host "[OK] Backup created."
 
-          Write-Host ""
-          Write-Host "Backup files:"
-
-
-          Get-ChildItem `
-            $env:DAO_BACKUP `
-            -Recurse `
-            -File |
-            Select-Object Name,Length |
-            Format-Table -AutoSize
-
-
-
-      # ============================================================
+      # ==========================================================
       # 12. UPLOAD BACKUP
-      # ============================================================
+      # ==========================================================
 
-      - name: Upload DAO backup
+      - name: Upload backup
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dao-windows-backup
-          path: D:\DAO-Backup
-          if-no-files-found: error
+          path: D:\DAO-BACKUP
+          if-no-files-found: warn
           retention-days: 30
           compression-level: 6
 
+      # ==========================================================
+      # 13. STOP SERVICES
+      # ==========================================================
 
-      # ============================================================
-      # 13. KEEP REMOTE ALIVE FOR FINAL 10 MINUTES
-      # ============================================================
-
-      - name: Final 10 minutes
-        run: |
-
-          $seconds = 600
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "       BACKUP COMPLETE"
-          Write-Host "       REMOTE STILL ACTIVE"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "Backup has been uploaded."
-          Write-Host "Remote will remain active for 10 minutes."
-          Write-Host ""
-
-
-          for (
-            $i = $seconds;
-            $i -gt 0;
-            $i -= 15
-          ) {
-
-            $minutes =
-              [math]::Floor($i / 60)
-
-            $remainingSeconds =
-              $i % 60
-
-
-            Write-Host `
-              "Final runtime: $minutes min $remainingSeconds sec"
-
-
-            Start-Sleep -Seconds 15
-          }
-
-
-          Write-Host ""
-          Write-Host "Final 10 minutes completed."
-
-
-
-      # ============================================================
-      # 14. STOP SERVICES
-      # ============================================================
-
-      - name: Stop remote services
+      - name: Stop services
         if: always()
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = "Continue"
 
-
-          Write-Host ""
-          Write-Host "Stopping DAO services..."
-          Write-Host ""
-
+          Write-Host "Stopping remote services..."
 
           Get-Process `
             -Name cloudflared `
@@ -1660,7 +856,6 @@ Not stored.
               -Force `
               -ErrorAction SilentlyContinue
 
-
           Get-Process `
             -Name websockify `
             -ErrorAction SilentlyContinue |
@@ -1668,163 +863,62 @@ Not stored.
               -Force `
               -ErrorAction SilentlyContinue
 
-
           $vnc = $null
 
-
-          foreach ($candidate in @(
+          $paths = @(
             "$env:ProgramFiles\TightVNC\tvnserver.exe",
             "$env:ProgramFiles\TightVNC\winvnc.exe",
             "${env:ProgramFiles(x86)}\TightVNC\tvnserver.exe",
             "${env:ProgramFiles(x86)}\TightVNC\winvnc.exe"
-          )) {
+          )
 
-            if (Test-Path $candidate) {
-
-              $vnc = $candidate
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              $vnc = $path
               break
             }
           }
 
-
           if ($vnc) {
-
-            try {
-
-              & $vnc `
-                -stop `
-                -silent `
-                2>&1 |
-                Out-File `
-                  (
-                    Join-Path `
-                      $env:DAO_LOGS `
-                      "vnc.log"
-                  ) `
-                  -Append
-
-            }
-            catch {
-            }
+            & $vnc -stop -silent 2>&1 | Out-Null
           }
 
+          Write-Host "[OK] Services stopped."
 
-          Write-Host "[OK] DAO services stopped."
+      # ==========================================================
+      # 14. UPLOAD LOGS
+      # ==========================================================
 
-
-
-      # ============================================================
-      # 15. CREATE FINAL LOG
-      # ============================================================
-
-      - name: Create final log
-        if: always()
-        run: |
-
-          $summary =
-            Join-Path `
-              $env:DAO_LOGS `
-              "workflow-summary.txt"
-
-
-          @"
-DAO WINDOWS DESKTOP
-===================
-
-Repository:
-$env:GITHUB_REPOSITORY
-
-Run:
-$env:GITHUB_RUN_ID
-
-Runner:
-$env:RUNNER_NAME
-
-Remote:
-noVNC
-
-VNC:
-TCP 5900
-
-Web:
-TCP 6080
-
-Runtime:
-4 hours
-
-Backup:
-03:50:00
-
-Shutdown:
-04:00:00
-
-Applications:
-FileZilla
-Notepad++
-
-Backup:
-dao-windows-backup
-
-Secrets:
-Not stored in logs.
-
-Generated:
-$(Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
-"@ |
-            Set-Content `
-              -Path $summary `
-              -Encoding UTF8
-
-
-
-      # ============================================================
-      # 16. UPLOAD LOGS
-      # ============================================================
-
-      - name: Upload DAO logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dao-windows-logs
-          path: D:\DAO-Logs
+          path: D:\DAO-LOGS
           if-no-files-found: warn
           retention-days: 14
           compression-level: 6
 
+      # ==========================================================
+      # 15. FINAL
+      # ==========================================================
 
-      # ============================================================
-      # 17. FINAL
-      # ============================================================
-
-      - name: Final dashboard
+      - name: Final
         if: always()
+        shell: pwsh
         run: |
-
           Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "        DAO WINDOWS DESKTOP"
-          Write-Host "             FINISHED"
-          Write-Host "=============================================="
+          Write-Host "=========================================="
+          Write-Host "DAO WINDOWS DESKTOP FINISHED"
+          Write-Host "=========================================="
           Write-Host ""
-
-          Write-Host "Backup:"
+          Write-Host "Backup artifact:"
           Write-Host "dao-windows-backup"
           Write-Host ""
-
-          Write-Host "Logs:"
+          Write-Host "Logs artifact:"
           Write-Host "dao-windows-logs"
           Write-Host ""
-
-          Write-Host "Runtime:"
-          Write-Host "4 hours"
+          Write-Host "Next run:"
+          Write-Host "Previous backup will be restored automatically."
           Write-Host ""
-
-          Write-Host "Backup:"
-          Write-Host "10 minutes before shutdown"
-          Write-Host ""
-
-          Write-Host "Remote:"
-          Write-Host "noVNC + Cloudflare"
-          Write-Host ""
-
-          Write-Host "=============================================="
+          Write-Host "=========================================="
