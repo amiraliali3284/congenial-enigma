@@ -17,14 +17,11 @@ env:
   DAO_TOOLS: D:\DAO-Tools
   DAO_BACKUP: D:\DAO-Backup
   DAO_RESTORE: D:\DAO-Restore
-
   DAO_SCRIPTS: ${{ github.workspace }}\scripts
 
   DAO_BACKUP_NAME: dao-windows-backup
   DAO_LOGS_NAME: dao-windows-logs
 
-  # 3 hours 45 minutes.
-  # Leaves approximately 15 minutes before the 4-hour job timeout.
   DAO_MAX_RUNTIME_SECONDS: 13500
 
 jobs:
@@ -43,9 +40,9 @@ jobs:
 
     steps:
 
-      # ============================================================
+      # ========================================================
       # 1. CHECKOUT
-      # ============================================================
+      # ========================================================
 
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -53,12 +50,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-
-      # ============================================================
+      # ========================================================
       # 2. INITIALIZE
-      # ============================================================
+      # ========================================================
 
       - name: Initialize DAO environment
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -71,15 +68,11 @@ jobs:
           )
 
           foreach ($directory in $directories) {
-
-            if (-not (Test-Path -LiteralPath $directory)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $directory `
-                -Force |
-                Out-Null
-            }
+            New-Item `
+              -ItemType Directory `
+              -Path $directory `
+              -Force |
+              Out-Null
           }
 
           Write-Host ""
@@ -88,100 +81,75 @@ jobs:
           Write-Host "=============================================="
           Write-Host ""
 
-          Write-Host "Runner:"
-          Write-Host $env:RUNNER_NAME
-
+          Write-Host "Runner      : $env:RUNNER_NAME"
+          Write-Host "OS          : $env:RUNNER_OS"
+          Write-Host "Architecture: $env:PROCESSOR_ARCHITECTURE"
           Write-Host ""
-          Write-Host "OS:"
-          Write-Host $env:RUNNER_OS
+          Write-Host "Workspace   : $env:DAO_ROOT"
+          Write-Host "Logs        : $env:DAO_LOGS"
+          Write-Host "Tools       : $env:DAO_TOOLS"
+          Write-Host "Backup      : $env:DAO_BACKUP"
+          Write-Host "Restore     : $env:DAO_RESTORE"
 
-          Write-Host ""
-          Write-Host "Workspace:"
-          Write-Host $env:DAO_ROOT
-
-          Write-Host ""
-          Write-Host "Logs:"
-          Write-Host $env:DAO_LOGS
-
-          Write-Host ""
-          Write-Host "Tools:"
-          Write-Host $env:DAO_TOOLS
-
-          Write-Host ""
-          Write-Host "Backup:"
-          Write-Host $env:DAO_BACKUP
-
-          Write-Host ""
-          Write-Host "Restore:"
-          Write-Host $env:DAO_RESTORE
-
-
-      # ============================================================
+      # ========================================================
       # 3. VALIDATE SCRIPTS
-      # ============================================================
+      # ========================================================
 
       - name: Validate DAO scripts
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $requiredScripts = @(
+          $required = @(
             'desktop.ps1',
             'restore.ps1',
             'backup.ps1'
           )
 
-          foreach ($scriptName in $requiredScripts) {
+          foreach ($name in $required) {
 
-            $scriptPath = Join-Path `
+            $path = Join-Path `
               $env:DAO_SCRIPTS `
-              $scriptName
+              $name
 
-            if (-not (
-              Test-Path `
-                -LiteralPath $scriptPath `
-                -PathType Leaf
-            )) {
-
-              throw "Required script not found: $scriptPath"
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required script not found: $path"
             }
 
-            Write-Host "[OK] $scriptName"
+            Write-Host "[OK] $name"
           }
 
-
-      # ============================================================
+      # ========================================================
       # 4. VALIDATE SECRETS
-      # ============================================================
+      # ========================================================
 
       - name: Validate required secrets
+        shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          if ([string]::IsNullOrWhiteSpace(
-            $env:VNC_PASSWORD
-          )) {
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
             throw "GitHub Secret VNC_PASSWORD is missing."
           }
 
-          if ([string]::IsNullOrWhiteSpace(
-            $env:ANYDESK_PASSWORD
-          )) {
+          if ([string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
             throw "GitHub Secret ANYDESK_PASSWORD is missing."
           }
 
-          Write-Host "[OK] VNC_PASSWORD configured."
-          Write-Host "[OK] ANYDESK_PASSWORD configured."
+          Write-Host "[OK] VNC_PASSWORD is configured."
+          Write-Host "[OK] ANYDESK_PASSWORD is configured."
 
-
-      # ============================================================
-      # 5. CHECK TOOLING
-      # ============================================================
+      # ========================================================
+      # 5. TOOLING
+      # ========================================================
 
       - name: Check runner tooling
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
 
           Write-Host ""
           Write-Host "PowerShell:"
@@ -189,7 +157,6 @@ jobs:
 
           Write-Host ""
           Write-Host "GitHub CLI:"
-
           try {
             gh --version |
               Select-Object -First 1
@@ -200,7 +167,6 @@ jobs:
 
           Write-Host ""
           Write-Host "winget:"
-
           try {
             winget --version
           }
@@ -210,7 +176,6 @@ jobs:
 
           Write-Host ""
           Write-Host "Python:"
-
           try {
             python --version
           }
@@ -218,84 +183,49 @@ jobs:
             Write-Warning "Python unavailable."
           }
 
-
-      # ============================================================
-      # 6. FIND PREVIOUS SUCCESSFUL BACKUP
-      # ============================================================
+      # ========================================================
+      # 6. FIND PREVIOUS BACKUP
+      # ========================================================
 
       - name: Find latest DAO backup
         id: find_backup
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           CURRENT_RUN_ID: ${{ github.run_id }}
-          WORKFLOW_FILE: ${{ github.workflow_ref }}
         run: |
-
           $ErrorActionPreference = 'Continue'
 
           $found = $false
           $runId = ''
-          $artifactId = ''
 
           Write-Host ""
           Write-Host "=============================================="
           Write-Host "       SEARCHING FOR DAO BACKUP"
           Write-Host "=============================================="
-          Write-Host ""
 
           try {
 
-            # Get workflow filename from workflow_ref.
-            #
-            # Example:
-            # owner/repo/.github/workflows/windows-desktop.yml@main
-            #
-
-            $workflowRef = $env:WORKFLOW_FILE
-
-            $workflowFile = (
-              $workflowRef -split '/workflows/' |
-              Select-Object -Last 1
-            )
-
-            $workflowFile = (
-              $workflowFile -split '@' |
-              Select-Object -First 1
-            )
-
-            if ([string]::IsNullOrWhiteSpace($workflowFile)) {
-              throw "Could not determine workflow filename."
-            }
-
-            Write-Host "Workflow: $workflowFile"
-            Write-Host ""
-
             $runsJson = gh run list `
               --repo $env:REPOSITORY `
-              --workflow $workflowFile `
+              --workflow windows-desktop.yml `
               --status completed `
               --limit 50 `
               --json databaseId,status,conclusion,createdAt
 
-            if ([string]::IsNullOrWhiteSpace($runsJson)) {
-
-              Write-Host "[INFO] No previous runs found."
-
-            }
-            else {
+            if (-not [string]::IsNullOrWhiteSpace($runsJson)) {
 
               $runs = @(
                 $runsJson |
-                ConvertFrom-Json
+                  ConvertFrom-Json
               )
 
               foreach ($run in $runs) {
 
                 if (
                   [string]$run.databaseId `
-                  -eq `
-                  [string]$env:CURRENT_RUN_ID
+                    -eq [string]$env:CURRENT_RUN_ID
                 ) {
                   continue
                 }
@@ -306,50 +236,42 @@ jobs:
 
                 try {
 
-                  $apiPath =
+                  $apiPath = `
                     "/repos/$env:REPOSITORY/actions/runs/$($run.databaseId)/artifacts?per_page=100"
 
                   $artifactJson = gh api `
                     -H "Accept: application/vnd.github+json" `
                     $apiPath
 
-                  if ([string]::IsNullOrWhiteSpace(
-                    $artifactJson
-                  )) {
+                  if ([string]::IsNullOrWhiteSpace($artifactJson)) {
                     continue
                   }
 
-                  $artifactResponse =
+                  $artifactResponse = `
                     $artifactJson |
                     ConvertFrom-Json
 
                   $candidate = @(
                     $artifactResponse.artifacts |
-                    Where-Object {
-                      $_.name -eq $env:DAO_BACKUP_NAME -and
-                      $_.expired -eq $false
-                    }
+                      Where-Object {
+                        $_.name -eq $env:DAO_BACKUP_NAME -and
+                        $_.expired -eq $false
+                      }
                   ) |
                   Select-Object -First 1
 
                   if ($null -ne $candidate) {
 
                     $found = $true
-
-                    $runId =
-                      [string]$run.databaseId
-
-                    $artifactId =
-                      [string]$candidate.id
+                    $runId = [string]$run.databaseId
 
                     Write-Host "[OK] Backup found."
                     Write-Host "Run ID: $runId"
-                    Write-Host "Artifact ID: $artifactId"
+                    Write-Host "Artifact ID: $($candidate.id)"
                     Write-Host "Created: $($run.createdAt)"
 
                     break
                   }
-
                 }
                 catch {
 
@@ -366,8 +288,7 @@ jobs:
           }
 
           if (-not $found) {
-            Write-Host ""
-            Write-Host "[INFO] No valid previous DAO backup found."
+            Write-Host "[INFO] No valid previous backup found."
           }
 
           "found=$($found.ToString().ToLowerInvariant())" |
@@ -382,26 +303,18 @@ jobs:
               -Append `
               -Encoding utf8
 
-          "artifact_id=$artifactId" |
-            Out-File `
-              -FilePath $env:GITHUB_OUTPUT `
-              -Append `
-              -Encoding utf8
-
-
-      # ============================================================
+      # ========================================================
       # 7. DOWNLOAD BACKUP
-      # ============================================================
+      # ========================================================
 
       - name: Download previous DAO backup
-        id: download_backup
         if: steps.find_backup.outputs.found == 'true'
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           BACKUP_RUN_ID: ${{ steps.find_backup.outputs.run_id }}
         run: |
-
           $ErrorActionPreference = 'Stop'
 
           if (Test-Path -LiteralPath $env:DAO_RESTORE) {
@@ -419,11 +332,6 @@ jobs:
             -Force |
             Out-Null
 
-          Write-Host ""
-          Write-Host "Downloading previous DAO backup..."
-          Write-Host "Run ID: $env:BACKUP_RUN_ID"
-          Write-Host ""
-
           gh run download `
             $env:BACKUP_RUN_ID `
             --repo $env:REPOSITORY `
@@ -431,7 +339,7 @@ jobs:
             --dir $env:DAO_RESTORE
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Backup artifact download failed."
+            throw "GitHub backup artifact download failed."
           }
 
           $files = @(
@@ -449,64 +357,41 @@ jobs:
           Write-Host "[OK] Backup downloaded."
           Write-Host "Files: $($files.Count)"
 
-          "downloaded=true" |
-            Out-File `
-              -FilePath $env:GITHUB_OUTPUT `
-              -Append `
-              -Encoding utf8
-
-
-      # ============================================================
+      # ========================================================
       # 8. RESTORE
-      # ============================================================
+      # ========================================================
 
       - name: Restore DAO data
-        if: steps.download_backup.outputs.downloaded == 'true'
-        env:
-          DAO_RESTORE_DIR: D:\DAO-Restore
-          DAO_WORKSPACE: D:\DAO-Workspace
-          DAO_LOGS: D:\DAO-Logs
+        if: always()
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = 'Continue'
 
           $restoreScript = Join-Path `
             $env:DAO_SCRIPTS `
             'restore.ps1'
 
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "             DAO RESTORE"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          if (-not (
-            Test-Path `
-              -LiteralPath $restoreScript `
-              -PathType Leaf
-          )) {
-
-            throw "restore.ps1 not found."
+          if (-not (Test-Path -LiteralPath $restoreScript)) {
+            Write-Warning "restore.ps1 not found."
+            exit 0
           }
 
           try {
 
             & $restoreScript `
-              -RestoreRoot $env:DAO_RESTORE_DIR `
-              -WorkspaceRoot $env:DAO_WORKSPACE `
+              -RestoreRoot $env:DAO_RESTORE `
+              -WorkspaceRoot $env:DAO_ROOT `
               -LogsRoot $env:DAO_LOGS
 
-            if ($LASTEXITCODE -eq 0) {
+            $code = $LASTEXITCODE
 
+            if ($code -eq 0) {
               Write-Host "[OK] Restore completed."
-
             }
             else {
-
               Write-Warning `
-                "Restore returned exit code $LASTEXITCODE."
+                "Restore returned exit code $code."
             }
-
           }
           catch {
 
@@ -514,101 +399,63 @@ jobs:
               "Restore warning: $($_.Exception.Message)"
           }
 
-
-      # ============================================================
+      # ========================================================
       # 9. START DESKTOP
-      # ============================================================
+      # ========================================================
 
       - name: Start DAO desktop
         id: start_desktop
+        shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
-
-          DAO_WORKSPACE: D:\DAO-Workspace
-          DAO_LOGS: D:\DAO-Logs
-          DAO_TOOLS: D:\DAO-Tools
         run: |
-
           $ErrorActionPreference = 'Stop'
 
           $desktopScript = Join-Path `
             $env:DAO_SCRIPTS `
             'desktop.ps1'
 
-          if (-not (
-            Test-Path `
-              -LiteralPath $desktopScript `
-              -PathType Leaf
-          )) {
-
-            throw "desktop.ps1 not found: $desktopScript"
+          if (-not (Test-Path -LiteralPath $desktopScript)) {
+            throw "desktop.ps1 not found."
           }
 
           Write-Host ""
           Write-Host "=============================================="
           Write-Host "       STARTING DAO WINDOWS DESKTOP"
           Write-Host "=============================================="
-          Write-Host ""
 
-          try {
+          & $desktopScript `
+            -WorkspaceRoot $env:DAO_ROOT `
+            -LogsRoot $env:DAO_LOGS `
+            -ToolsRoot $env:DAO_TOOLS `
+            -VncPassword $env:VNC_PASSWORD `
+            -AnyDeskPassword $env:ANYDESK_PASSWORD
 
-            & $desktopScript `
-              -WorkspaceRoot $env:DAO_WORKSPACE `
-              -LogsRoot $env:DAO_LOGS `
-              -ToolsRoot $env:DAO_TOOLS `
-              -VncPassword $env:VNC_PASSWORD `
-              -AnyDeskPassword $env:ANYDESK_PASSWORD
-
-            if ($LASTEXITCODE -ne 0) {
-
-              throw `
-                "desktop.ps1 returned exit code $LASTEXITCODE."
-            }
-
-          }
-          catch {
-
-            Write-Error "DAO desktop startup failed."
-            Write-Error $_.Exception.Message
-
-            if (
-              Test-Path `
-                -LiteralPath $env:DAO_LOGS
-            ) {
-
-              $_ |
-                Out-File `
-                  -FilePath (
-                    Join-Path `
-                      $env:DAO_LOGS `
-                      'desktop-startup-error.log'
-                  ) `
-                  -Append `
-                  -Encoding utf8
-            }
-
-            throw
+          if ($LASTEXITCODE -ne 0) {
+            throw "desktop.ps1 returned exit code $LASTEXITCODE."
           }
 
-
-      # ============================================================
-      # 10. DISPLAY CONNECTION INFO
-      # ============================================================
+      # ========================================================
+      # 10. DASHBOARD
+      # ========================================================
 
       - name: Display DAO connection dashboard
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = 'Continue'
 
-          $infoFile =
-            Join-Path $env:DAO_LOGS 'connection-info.txt'
+          $infoFile = Join-Path `
+            $env:DAO_LOGS `
+            'connection-info.txt'
 
-          $urlFile =
-            Join-Path $env:DAO_LOGS 'novnc-url.txt'
+          $urlFile = Join-Path `
+            $env:DAO_LOGS `
+            'novnc-url.txt'
 
-          $idFile =
-            Join-Path $env:DAO_LOGS 'anydesk-id.txt'
+          $idFile = Join-Path `
+            $env:DAO_LOGS `
+            'anydesk-id.txt'
 
           Write-Host ""
           Write-Host "=============================================="
@@ -616,20 +463,12 @@ jobs:
           Write-Host "=============================================="
           Write-Host ""
 
-          Write-Host "Windows:"
-          Write-Host "Windows Server 2025"
-          Write-Host ""
-
           Write-Host "Workspace:"
           Write-Host $env:DAO_ROOT
           Write-Host ""
 
-          Write-Host "VNC:"
-          Write-Host "TCP 5900"
-          Write-Host ""
-
-          Write-Host "noVNC:"
-          Write-Host "TCP 6080"
+          Write-Host "VNC TCP: 5900"
+          Write-Host "noVNC TCP: 6080"
           Write-Host ""
 
           if (Test-Path -LiteralPath $idFile) {
@@ -639,15 +478,9 @@ jobs:
               -Raw `
               -ErrorAction SilentlyContinue
 
-            if ($null -ne $id) {
-              $id = $id.Trim()
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($id)) {
-
+            if ($id) {
               Write-Host "AnyDesk:"
-              Write-Host "Status: RUNNING"
-              Write-Host "ID: $id"
+              Write-Host "ID: $($id.Trim())"
               Write-Host ""
             }
           }
@@ -659,62 +492,42 @@ jobs:
               -Raw `
               -ErrorAction SilentlyContinue
 
-            if ($null -ne $url) {
-              $url = $url.Trim()
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($url)) {
-
+            if ($url) {
               Write-Host "WEB URL:"
-              Write-Host $url
+              Write-Host $url.Trim()
               Write-Host ""
             }
           }
 
           if (Test-Path -LiteralPath $infoFile) {
 
-            Write-Host "=============================================="
             Write-Host "Connection information:"
-            Write-Host "=============================================="
+            Write-Host "----------------------------------------------"
 
             Get-Content `
               -LiteralPath $infoFile `
               -ErrorAction SilentlyContinue
           }
 
-          Write-Host ""
-          Write-Host "=============================================="
-
-
-      # ============================================================
+      # ========================================================
       # 11. KEEP ALIVE
-      # ============================================================
+      # ========================================================
 
       - name: Keep DAO desktop alive
         id: keepalive
+        shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
-
-          DAO_WORKSPACE: D:\DAO-Workspace
-          DAO_LOGS: D:\DAO-Logs
-          DAO_TOOLS: D:\DAO-Tools
-
-          DAO_RUNTIME_SECONDS: 13500
         run: |
-
           $ErrorActionPreference = 'Continue'
 
-          $maximumSeconds =
-            [int]$env:DAO_RUNTIME_SECONDS
+          $maximumSeconds = [int]$env:DAO_MAX_RUNTIME_SECONDS
 
           $started = Get-Date
-
-          $deadline =
-            $started.AddSeconds($maximumSeconds)
+          $deadline = $started.AddSeconds($maximumSeconds)
 
           $lastSupervisor = Get-Date
-
           $supervisorIntervalSeconds = 60
 
           Write-Host ""
@@ -722,10 +535,8 @@ jobs:
           Write-Host "          DAO DESKTOP ACTIVE"
           Write-Host "=============================================="
           Write-Host ""
-
           Write-Host "Maximum runtime: 03:45:00"
-          Write-Host "Job timeout:      04:00:00"
-          Write-Host ""
+          Write-Host "Workflow limit:  04:00:00"
 
           while ((Get-Date) -lt $deadline) {
 
@@ -735,57 +546,34 @@ jobs:
               ($now - $started).TotalSeconds
             )
 
-            if ($elapsedSeconds -lt 0) {
-              $elapsedSeconds = 0
-            }
-
             $remainingSeconds =
-              $maximumSeconds - $elapsedSeconds
+              [math]::Max(
+                0,
+                $maximumSeconds - $elapsedSeconds
+              )
 
-            if ($remainingSeconds -lt 0) {
-              $remainingSeconds = 0
-            }
-
-            $eh = [math]::Floor(
-              $elapsedSeconds / 3600
-            )
-
+            $eh = [math]::Floor($elapsedSeconds / 3600)
             $em = [math]::Floor(
               ($elapsedSeconds % 3600) / 60
             )
-
             $es = $elapsedSeconds % 60
 
-            $rh = [math]::Floor(
-              $remainingSeconds / 3600
-            )
-
+            $rh = [math]::Floor($remainingSeconds / 3600)
             $rm = [math]::Floor(
               ($remainingSeconds % 3600) / 60
             )
-
             $rs = $remainingSeconds % 60
 
-            $elapsedText =
-              '{0:D2}:{1:D2}:{2:D2}' -f `
-              $eh, `
-              $em, `
-              $es
+            $elapsedText = '{0:D2}:{1:D2}:{2:D2}' -f `
+              $eh, $em, $es
 
-            $remainingText =
-              '{0:D2}:{1:D2}:{2:D2}' -f `
-              $rh, `
-              $rm, `
-              $rs
+            $remainingText = '{0:D2}:{1:D2}:{2:D2}' -f `
+              $rh, $rm, $rs
 
             Write-Host ""
             Write-Host "DAO Desktop active"
             Write-Host "Runtime:   $elapsedText / 03:45:00"
             Write-Host "Remaining: $remainingText"
-
-            # --------------------------------------------------------
-            # PORT CHECK
-            # --------------------------------------------------------
 
             foreach ($port in @(5900, 6080)) {
 
@@ -796,51 +584,35 @@ jobs:
                   -State Listen `
                   -ErrorAction SilentlyContinue
 
-                if ($null -ne $listener) {
-
-                  Write-Host `
-                    "[OK] TCP $port LISTENING"
-
+                if ($listener) {
+                  Write-Host "[OK] TCP $port LISTENING"
                 }
                 else {
-
                   Write-Warning `
                     "[WARN] TCP $port is NOT listening."
                 }
-
               }
               catch {
-
                 Write-Warning `
                   "Could not inspect TCP $port."
               }
             }
 
-            # --------------------------------------------------------
-            # SUPERVISOR
-            # --------------------------------------------------------
-
             if (
               ((Get-Date) - $lastSupervisor).TotalSeconds `
-              -ge `
-              $supervisorIntervalSeconds
+                -ge $supervisorIntervalSeconds
             ) {
 
-              $desktopScript =
-                Join-Path `
-                  $env:DAO_SCRIPTS `
-                  'desktop.ps1'
+              $desktopScript = Join-Path `
+                $env:DAO_SCRIPTS `
+                'desktop.ps1'
 
-              if (
-                Test-Path `
-                  -LiteralPath $desktopScript `
-                  -PathType Leaf
-              ) {
+              if (Test-Path -LiteralPath $desktopScript) {
 
                 try {
 
                   & $desktopScript `
-                    -WorkspaceRoot $env:DAO_WORKSPACE `
+                    -WorkspaceRoot $env:DAO_ROOT `
                     -LogsRoot $env:DAO_LOGS `
                     -ToolsRoot $env:DAO_TOOLS `
                     -VncPassword $env:VNC_PASSWORD `
@@ -852,12 +624,11 @@ jobs:
                     Write-Warning `
                       "Supervisor returned exit code $LASTEXITCODE."
                   }
-
                 }
                 catch {
 
                   Write-Warning `
-                    "Supervisor failed: $($_.Exception.Message)"
+                    "Supervisor check failed: $($_.Exception.Message)"
                 }
               }
 
@@ -871,45 +642,25 @@ jobs:
           Write-Host "=============================================="
           Write-Host "       DESKTOP RUNTIME COMPLETE"
           Write-Host "=============================================="
-          Write-Host ""
 
-          Write-Host "Beginning controlled shutdown."
-
-
-      # ============================================================
+      # ========================================================
       # 12. STOP SERVICES
-      # ============================================================
+      # ========================================================
 
       - name: Stop DAO services
         if: always()
+        shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
-
-          DAO_WORKSPACE: D:\DAO-Workspace
-          DAO_LOGS: D:\DAO-Logs
-          DAO_TOOLS: D:\DAO-Tools
         run: |
-
           $ErrorActionPreference = 'Continue'
 
-          $desktopScript =
-            Join-Path `
-              $env:DAO_SCRIPTS `
-              'desktop.ps1'
+          $desktopScript = Join-Path `
+            $env:DAO_SCRIPTS `
+            'desktop.ps1'
 
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "        STOPPING DAO SERVICES"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          if (-not (
-            Test-Path `
-              -LiteralPath $desktopScript `
-              -PathType Leaf
-          )) {
-
+          if (-not (Test-Path -LiteralPath $desktopScript)) {
             Write-Warning "desktop.ps1 unavailable."
             exit 0
           }
@@ -917,7 +668,7 @@ jobs:
           try {
 
             & $desktopScript `
-              -WorkspaceRoot $env:DAO_WORKSPACE `
+              -WorkspaceRoot $env:DAO_ROOT `
               -LogsRoot $env:DAO_LOGS `
               -ToolsRoot $env:DAO_TOOLS `
               -VncPassword $env:VNC_PASSWORD `
@@ -929,7 +680,6 @@ jobs:
               Write-Warning `
                 "Service cleanup returned exit code $LASTEXITCODE."
             }
-
           }
           catch {
 
@@ -937,57 +687,23 @@ jobs:
               "Service cleanup warning: $($_.Exception.Message)"
           }
 
-
-      # ============================================================
-      # 13. CREATE BACKUP
-      # ============================================================
+      # ========================================================
+      # 13. BACKUP
+      # ========================================================
 
       - name: Create DAO backup
         if: always()
-        id: create_backup
-        env:
-          DAO_WORKSPACE: D:\DAO-Workspace
-          DAO_LOGS: D:\DAO-Logs
-          DAO_BACKUP: D:\DAO-Backup
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = 'Continue'
 
-          $backupScript =
-            Join-Path `
-              $env:DAO_SCRIPTS `
-              'backup.ps1'
+          $backupScript = Join-Path `
+            $env:DAO_SCRIPTS `
+            'backup.ps1'
 
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "              DAO BACKUP"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          if (-not (
-            Test-Path `
-              -LiteralPath $backupScript `
-              -PathType Leaf
-          )) {
-
+          if (-not (Test-Path -LiteralPath $backupScript)) {
             Write-Error "backup.ps1 not found."
-
-            "created=false" |
-              Out-File `
-                -FilePath $env:GITHUB_OUTPUT `
-                -Append `
-                -Encoding utf8
-
-            exit 0
-          }
-
-          if (Test-Path -LiteralPath $env:DAO_BACKUP) {
-
-            Remove-Item `
-              -LiteralPath $env:DAO_BACKUP `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
+            exit 1
           }
 
           New-Item `
@@ -999,103 +715,70 @@ jobs:
           try {
 
             & $backupScript `
-              -WorkspaceRoot $env:DAO_WORKSPACE `
+              -WorkspaceRoot $env:DAO_ROOT `
               -LogsRoot $env:DAO_LOGS `
               -BackupRoot $env:DAO_BACKUP
 
             $code = $LASTEXITCODE
 
             if ($code -eq 0) {
-
-              Write-Host "[OK] Backup script completed."
-
+              Write-Host "[OK] Backup completed."
             }
             else {
-
               Write-Warning `
-                "Backup script returned exit code $code."
+                "Backup returned exit code $code."
             }
-
           }
           catch {
 
             Write-Warning `
-              "Backup script exception: $($_.Exception.Message)"
+              "Backup exception: $($_.Exception.Message)"
           }
-
-          $backupFiles = @(
-            Get-ChildItem `
-              -LiteralPath $env:DAO_BACKUP `
-              -Recurse `
-              -File `
-              -ErrorAction SilentlyContinue
-          )
 
           Write-Host ""
-          Write-Host "Backup files: $($backupFiles.Count)"
+          Write-Host "Backup contents:"
 
-          if ($backupFiles.Count -gt 0) {
+          Get-ChildItem `
+            -LiteralPath $env:DAO_BACKUP `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
 
-            "created=true" |
-              Out-File `
-                -FilePath $env:GITHUB_OUTPUT `
-                -Append `
-                -Encoding utf8
-
-          }
-          else {
-
-            Write-Warning "Backup directory is empty."
-
-            "created=false" |
-              Out-File `
-                -FilePath $env:GITHUB_OUTPUT `
-                -Append `
-                -Encoding utf8
-          }
-
-
-      # ============================================================
+      # ========================================================
       # 14. UPLOAD BACKUP
-      # ============================================================
+      # ========================================================
 
       - name: Upload DAO backup artifact
-        if: steps.create_backup.outputs.created == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dao-windows-backup
           path: D:\DAO-Backup
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
           compression-level: 6
 
-
-      # ============================================================
+      # ========================================================
       # 15. PREPARE LOG SUMMARY
-      # ============================================================
+      # ========================================================
 
       - name: Prepare DAO logs
         if: always()
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = 'Continue'
 
-          if (-not (
-            Test-Path `
-              -LiteralPath $env:DAO_LOGS
-          )) {
+          New-Item `
+            -ItemType Directory `
+            -Path $env:DAO_LOGS `
+            -Force |
+            Out-Null
 
-            New-Item `
-              -ItemType Directory `
-              -Path $env:DAO_LOGS `
-              -Force |
-              Out-Null
-          }
-
-          $summaryFile =
-            Join-Path `
-              $env:DAO_LOGS `
-              'workflow-summary.txt'
+          $summaryFile = Join-Path `
+            $env:DAO_LOGS `
+            'workflow-summary.txt'
 
           $summary = @"
 DAO WINDOWS DESKTOP
@@ -1129,9 +812,8 @@ Runtime:
 Generated:
 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')
 
-Security:
-Passwords and GitHub tokens are not intentionally
-stored in this summary.
+IMPORTANT:
+Passwords and GitHub tokens are not stored in this summary.
 "@
 
           Set-Content `
@@ -1139,20 +821,9 @@ stored in this summary.
             -Value $summary `
             -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "DAO log files:"
-
-          Get-ChildItem `
-            -LiteralPath $env:DAO_LOGS `
-            -File `
-            -ErrorAction SilentlyContinue |
-            Select-Object Name, Length |
-            Format-Table -AutoSize
-
-
-      # ============================================================
+      # ========================================================
       # 16. UPLOAD LOGS
-      # ============================================================
+      # ========================================================
 
       - name: Upload DAO logs artifact
         if: always()
@@ -1164,31 +835,27 @@ stored in this summary.
           retention-days: 14
           compression-level: 6
 
-
-      # ============================================================
+      # ========================================================
       # 17. FINAL DASHBOARD
-      # ============================================================
+      # ========================================================
 
       - name: Final DAO dashboard
         if: always()
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = 'Continue'
 
-          $urlFile =
-            Join-Path `
-              $env:DAO_LOGS `
-              'novnc-url.txt'
+          $urlFile = Join-Path `
+            $env:DAO_LOGS `
+            'novnc-url.txt'
 
-          $idFile =
-            Join-Path `
-              $env:DAO_LOGS `
-              'anydesk-id.txt'
+          $idFile = Join-Path `
+            $env:DAO_LOGS `
+            'anydesk-id.txt'
 
-          $infoFile =
-            Join-Path `
-              $env:DAO_LOGS `
-              'connection-info.txt'
+          $infoFile = Join-Path `
+            $env:DAO_LOGS `
+            'connection-info.txt'
 
           Write-Host ""
           Write-Host "=============================================="
@@ -1196,67 +863,38 @@ stored in this summary.
           Write-Host "=============================================="
           Write-Host ""
 
-          Write-Host "Windows:"
-          Write-Host "Windows Server 2025"
-          Write-Host ""
-
           Write-Host "Workspace:"
           Write-Host $env:DAO_ROOT
           Write-Host ""
 
-          Write-Host "VNC:"
-          Write-Host "TCP 5900"
-          Write-Host ""
-
-          Write-Host "noVNC:"
-          Write-Host "TCP 6080"
+          Write-Host "VNC TCP: 5900"
+          Write-Host "noVNC TCP: 6080"
           Write-Host ""
 
           if (Test-Path -LiteralPath $idFile) {
 
-            $anyDeskId =
-              Get-Content `
-                -LiteralPath $idFile `
-                -Raw `
-                -ErrorAction SilentlyContinue
+            $id = Get-Content `
+              -LiteralPath $idFile `
+              -Raw `
+              -ErrorAction SilentlyContinue
 
-            if ($null -ne $anyDeskId) {
-              $anyDeskId = $anyDeskId.Trim()
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace(
-              $anyDeskId
-            )) {
-
-              Write-Host "AnyDesk:"
-              Write-Host "Status: RUNNING"
-              Write-Host "ID: $anyDeskId"
+            if ($id) {
+              Write-Host "AnyDesk ID:"
+              Write-Host $id.Trim()
               Write-Host ""
             }
           }
 
           if (Test-Path -LiteralPath $urlFile) {
 
-            $noVncUrl =
-              Get-Content `
-                -LiteralPath $urlFile `
-                -Raw `
-                -ErrorAction SilentlyContinue
+            $url = Get-Content `
+              -LiteralPath $urlFile `
+              -Raw `
+              -ErrorAction SilentlyContinue
 
-            if ($null -ne $noVncUrl) {
-              $noVncUrl = $noVncUrl.Trim()
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace(
-              $noVncUrl
-            )) {
-
-              Write-Host "=============================================="
+            if ($url) {
               Write-Host "PUBLIC noVNC URL:"
-              Write-Host ""
-              Write-Host $noVncUrl
-              Write-Host ""
-              Write-Host "=============================================="
+              Write-Host $url.Trim()
               Write-Host ""
             }
           }
@@ -1274,11 +912,11 @@ stored in this summary.
           }
 
           Write-Host "Backup artifact:"
-          Write-Host $env:DAO_BACKUP_NAME
+          Write-Host "dao-windows-backup"
           Write-Host ""
 
           Write-Host "Logs artifact:"
-          Write-Host $env:DAO_LOGS_NAME
+          Write-Host "dao-windows-logs"
           Write-Host ""
 
           Write-Host "Maximum desktop runtime:"
@@ -1289,10 +927,9 @@ stored in this summary.
           Write-Host "04:00:00"
           Write-Host ""
 
-          Write-Host "IMPORTANT:"
-          Write-Host "Passwords and GitHub tokens are not displayed."
-          Write-Host ""
+          Write-Host "Passwords and tokens are not displayed."
 
+          Write-Host ""
           Write-Host "=============================================="
           Write-Host "             DAO DESKTOP END"
           Write-Host "=============================================="
