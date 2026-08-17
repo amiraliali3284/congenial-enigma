@@ -554,10 +554,9 @@ jobs:
           # Install cloudflared if required
           # --------------------------------------------------------
 
-          $cloudflared = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
+          $cloudflaredPath = Join-Path $env:DAO_TOOLS "cloudflared.exe"
 
-          if (-not $cloudflared) {
-            $cloudflaredPath = Join-Path $env:DAO_TOOLS "cloudflared.exe"
+          if (-not (Test-Path $cloudflaredPath)) {
 
             Write-Host "Downloading cloudflared..."
 
@@ -566,13 +565,26 @@ jobs:
               -OutFile $cloudflaredPath `
               -UseBasicParsing
 
-            $cloudflared = Get-Item $cloudflaredPath
+          }
+
+          if (-not (Test-Path $cloudflaredPath)) {
+            throw "cloudflared.exe was not downloaded."
+          }
+
+          Write-Host "cloudflared path:"
+          Write-Host $cloudflaredPath
+
+          # Verify executable
+          & $cloudflaredPath --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "cloudflared.exe cannot be executed."
           }
 
           Write-Host "Starting Cloudflare Quick Tunnel..."
 
           Start-Process `
-            -FilePath $cloudflared.Source `
+            -FilePath $cloudflaredPath `
             -ArgumentList @(
               "tunnel",
               "--no-autoupdate",
@@ -587,16 +599,17 @@ jobs:
           $deadline = (Get-Date).AddSeconds(120)
 
           while ((Get-Date) -lt $deadline) {
+
             Start-Sleep -Seconds 2
 
             $text = ""
 
             if (Test-Path $cloudLog) {
-              $text += "`n" + (Get-Content $cloudLog -Raw)
+              $text += "`n" + (Get-Content $cloudLog -Raw -ErrorAction SilentlyContinue)
             }
 
             if (Test-Path $cloudError) {
-              $text += "`n" + (Get-Content $cloudError -Raw)
+              $text += "`n" + (Get-Content $cloudError -Raw -ErrorAction SilentlyContinue)
             }
 
             $match = [regex]::Match(
@@ -611,6 +624,7 @@ jobs:
           }
 
           if (-not $publicUrl) {
+
             Write-Host "Cloudflare output:"
 
             if (Test-Path $cloudLog) {
@@ -623,14 +637,7 @@ jobs:
 
             throw "Cloudflare tunnel URL was not found."
           }
-
-          $remoteUrl = "$publicUrl/vnc.html"
-
-          Set-Content `
-            -Path (Join-Path $env:DAO_LOGS "remote-url.txt") `
-            -Value $remoteUrl `
-            -NoNewline
-
+          
           Write-Host ""
           Write-Host "=========================================="
           Write-Host "REMOTE DESKTOP READY"
