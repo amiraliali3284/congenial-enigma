@@ -795,28 +795,30 @@ jobs:
             -CompressionLevel Optimal `
             -Force
 
-          @"
-DAO WINDOWS DESKTOP BACKUP
+          $backupInfo = @(
+            "DAO WINDOWS DESKTOP BACKUP"
+            ""
+            "Repository:"
+            $env:GITHUB_REPOSITORY
+            ""
+            "Run:"
+            $env:GITHUB_RUN_ID
+            ""
+            "Created:"
+            (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            ""
+            "Applications:"
+            "FileZilla"
+            "Notepad++"
+            ""
+            "Remote:"
+            "TightVNC + noVNC"
+            ""
+            "Secrets:"
+            "Not stored"
+          )
 
-Repository:
-$env:GITHUB_REPOSITORY
-
-Run:
-$env:GITHUB_RUN_ID
-
-Created:
-$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-
-Applications:
-FileZilla
-Notepad++
-
-Remote:
-TightVNC + noVNC
-
-Secrets:
-Not stored
-"@ |
+          $backupInfo |
             Set-Content `
               -Path (Join-Path $env:DAO_BACKUP "backup-info.txt") `
               -Encoding UTF8
