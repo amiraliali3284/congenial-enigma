@@ -2,429 +2,464 @@
 param()
 
 Set-StrictMode -Version Latest
+
 $ErrorActionPreference = "Continue"
 
 $Workspace = "D:\DAO-Workspace"
 $Logs      = "D:\DAO-Logs"
-$Staging   = "D:\DAO-Backup-Staging"
 
-$FileZilla = Join-Path $env:APPDATA "FileZilla"
-$Geany     = Join-Path $env:APPDATA "geany"
+$BackupRoot = Join-Path $env:RUNNER_TEMP "DAO-Backup"
+$Payload    = Join-Path $BackupRoot "DAO-Backup"
+$ZipFile    = Join-Path $Logs "dao-windows-backup.zip"
 
 $BackupLog = Join-Path $Logs "backup.log"
 
-New-Item -ItemType Directory -Path $Workspace -Force | Out-Null
-New-Item -ItemType Directory -Path $Logs -Force | Out-Null
+New-Item `
+    -ItemType Directory `
+    -Force `
+    -Path $Logs |
+    Out-Null
 
+function Backup-Log {
+    param([string]$Message)
 
-# ==============================================================
-# LOG
-# ==============================================================
-
-function Write-BackupLog {
-
-    param(
-        [string]$Message,
-
-        [ValidateSet("INFO","WARN","ERROR")]
-        [string]$Level = "INFO"
-    )
-
-    $line = "[{0}] [{1}] {2}" -f `
-        (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),
-        $Level,
-        $Message
-
-    Add-Content `
-        -LiteralPath $BackupLog `
-        -Value $line `
-        -Encoding UTF8
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
 
     Write-Host $line
-}
-
-
-# ==============================================================
-# ROBOCOPY TREE
-# ==============================================================
-
-function Backup-Tree {
-
-    param(
-        [Parameter(Mandatory)]
-        [string]$Source,
-
-        [Parameter(Mandatory)]
-        [string]$Destination,
-
-        [Parameter(Mandatory)]
-        [string]$Label
-    )
-
-    if (-not (Test-Path -LiteralPath $Source)) {
-
-        Write-BackupLog `
-            "$Label does not exist: $Source" `
-            "WARN"
-
-        return $false
-    }
 
     try {
-
-        New-Item `
-            -ItemType Directory `
-            -Path $Destination `
-            -Force | Out-Null
-
-        $args = @(
-            $Source,
-            $Destination,
-
-            "/E",
-            "/COPY:DAT",
-            "/DCOPY:DAT",
-
-            "/R:1",
-            "/W:1",
-
-            "/XJ",
-            "/FFT",
-            "/NP"
-        )
-
-        Write-BackupLog `
-            "Backing up $Label."
-
-        & robocopy @args 2>&1 |
-            ForEach-Object {
-
-                $line = [string]$_
-
-                Add-Content `
-                    -LiteralPath $BackupLog `
-                    -Value $line `
-                    -Encoding UTF8
-            }
-
-        $code = $LASTEXITCODE
-
-        # Robocopy:
-        # 0-7 = success / success with differences
-        # >=8 = failure
-        if ($code -lt 8) {
-
-            Write-BackupLog `
-                "$Label backup completed. Robocopy code: $code"
-
-            return $true
-        }
-
-        Write-BackupLog `
-            "$Label backup returned Robocopy code $code." `
-            "WARN"
-
-        return $false
+        Add-Content `
+            -LiteralPath $BackupLog `
+            -Value $line
     }
     catch {
-
-        Write-BackupLog `
-            "$Label backup failed: $($_.Exception.Message)" `
-            "WARN"
-
-        return $false
     }
 }
 
-
-# ==============================================================
-# SANITIZE STAGING
-# ==============================================================
-
-function Remove-TemporaryFiles {
-
+function Copy-SafeTree {
     param(
-        [Parameter(Mandatory)]
-        [string]$Root
+        [string]$Source,
+        [string]$Destination
     )
 
-    if (-not (Test-Path -LiteralPath $Root)) {
-        return
+    if (-not (Test-Path $Source)) {
+
+        Backup-Log "Source does not exist: $Source"
+
+        return @{
+            Copied  = 0
+            Failed  = 0
+            Skipped = 0
+        }
     }
 
-    $patterns = @(
-        "*.tmp",
-        "*.temp",
-        "~*"
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $Destination |
+        Out-Null
+
+    $dangerousExtensions = @(
+        ".exe",
+        ".msi",
+        ".msp",
+        ".com",
+        ".scr",
+        ".sys",
+        ".dll",
+        ".ocx",
+        ".cpl",
+        ".bat",
+        ".cmd",
+        ".ps1",
+        ".psm1",
+        ".psd1",
+        ".vbs",
+        ".vbe",
+        ".js",
+        ".jse",
+        ".wsf",
+        ".wsh",
+        ".hta"
     )
 
-    foreach ($pattern in $patterns) {
+    $excludedDirectoryNames = @(
+        "Windows",
+        "Temp",
+        "tmp",
+        "Cache",
+        "Caches",
+        "Code Cache",
+        "GPUCache",
+        "OneDrive",
+        "My Music",
+        "My Pictures",
+        "My Videos"
+    )
+
+    $copied = 0
+    $failed = 0
+    $skipped = 0
+
+    Get-ChildItem `
+        -LiteralPath $Source `
+        -Force `
+        -Recurse `
+        -File `
+        -ErrorAction SilentlyContinue |
+        ForEach-Object {
+
+            $file = $_
+
+            try {
+
+                $relative = $file.FullName.Substring(
+                    $Source.TrimEnd('\').Length
+                ).TrimStart('\')
+
+                $parts = $relative -split '[\\/]'
+
+                $skipDirectory = $false
+
+                foreach ($part in $parts) {
+
+                    if ($excludedDirectoryNames -contains $part) {
+                        $skipDirectory = $true
+                        break
+                    }
+                }
+
+                if ($skipDirectory) {
+
+                    $skipped++
+                    return
+                }
+
+                if ($dangerousExtensions -contains $file.Extension.ToLowerInvariant()) {
+
+                    $skipped++
+                    return
+                }
+
+                $target = Join-Path `
+                    $Destination `
+                    $relative
+
+                $targetDir = Split-Path `
+                    -Path $target `
+                    -Parent
+
+                New-Item `
+                    -ItemType Directory `
+                    -Force `
+                    -Path $targetDir |
+                    Out-Null
+
+                Copy-Item `
+                    -LiteralPath $file.FullName `
+                    -Destination $target `
+                    -Force `
+                    -ErrorAction Stop
+
+                $copied++
+            }
+            catch {
+
+                $failed++
+
+                Backup-Log `
+                    "WARNING: failed to backup $($file.FullName): $($_.Exception.Message)"
+            }
+        }
+
+    return @{
+        Copied  = $copied
+        Failed  = $failed
+        Skipped = $skipped
+    }
+}
+
+Backup-Log "=============================================="
+Backup-Log "DAO BACKUP START"
+Backup-Log "=============================================="
+
+# ============================================================
+# CLEAN OLD STAGING
+# ============================================================
+
+Remove-Item `
+    -LiteralPath $BackupRoot `
+    -Recurse `
+    -Force `
+    -ErrorAction SilentlyContinue
+
+New-Item `
+    -ItemType Directory `
+    -Force `
+    -Path $Payload |
+    Out-Null
+
+# ============================================================
+# WORKSPACE
+# ============================================================
+
+$totalCopied = 0
+$totalFailed = 0
+$totalSkipped = 0
+
+if (Test-Path $Workspace) {
+
+    Backup-Log "Backing up DAO workspace..."
+
+    $result = Copy-SafeTree `
+        -Source $Workspace `
+        -Destination (Join-Path $Payload "workspace")
+
+    $totalCopied += $result.Copied
+    $totalFailed += $result.Failed
+    $totalSkipped += $result.Skipped
+
+    Backup-Log "Workspace: copied=$($result.Copied), failed=$($result.Failed), skipped=$($result.Skipped)"
+}
+else {
+
+    Backup-Log "Workspace does not exist."
+}
+
+# ============================================================
+# FILEZILLA
+# ============================================================
+
+$filezilla = Join-Path $env:APPDATA "FileZilla"
+
+if (Test-Path $filezilla) {
+
+    Backup-Log "Backing up FileZilla configuration..."
+
+    $result = Copy-SafeTree `
+        -Source $filezilla `
+        -Destination (Join-Path $Payload "FileZilla")
+
+    $totalCopied += $result.Copied
+    $totalFailed += $result.Failed
+    $totalSkipped += $result.Skipped
+}
+
+# ============================================================
+# GEANY
+# ============================================================
+
+$geany = Join-Path $env:APPDATA "geany"
+
+if (Test-Path $geany) {
+
+    Backup-Log "Backing up Geany configuration..."
+
+    $result = Copy-SafeTree `
+        -Source $geany `
+        -Destination (Join-Path $Payload "Geany")
+
+    $totalCopied += $result.Copied
+    $totalFailed += $result.Failed
+    $totalSkipped += $result.Skipped
+}
+
+# ============================================================
+# DAO LOGS
+# ============================================================
+
+$daoData = Join-Path $Payload "dao-data"
+
+New-Item `
+    -ItemType Directory `
+    -Force `
+    -Path $daoData |
+    Out-Null
+
+# Copy selected logs only.
+$logFiles = @(
+    "vnc.log",
+    "websockify.log",
+    "websockify-error.log",
+    "cloudflared.log",
+    "cloudflared-error.log",
+    "anydesk.log",
+    "connection-info.txt",
+    "tunnel-url.txt",
+    "novnc-url.txt",
+    "anydesk-id.txt",
+    "restore.log",
+    "backup.log"
+)
+
+foreach ($logName in $logFiles) {
+
+    $source = Join-Path $Logs $logName
+
+    if (Test-Path $source) {
 
         try {
 
-            Get-ChildItem `
-                -LiteralPath $Root `
-                -File `
-                -Recurse `
+            Copy-Item `
+                -LiteralPath $source `
+                -Destination (Join-Path $daoData $logName) `
                 -Force `
-                -Filter $pattern `
-                -ErrorAction SilentlyContinue |
-                Remove-Item `
-                    -Force `
-                    -ErrorAction SilentlyContinue
+                -ErrorAction Stop
+
+            $totalCopied++
+
         }
         catch {
+
+            $totalFailed++
+
+            Backup-Log `
+                "WARNING: failed to copy log $logName : $($_.Exception.Message)"
         }
     }
 }
 
+# ============================================================
+# BACKUP METADATA
+# ============================================================
 
-# ==============================================================
-# SECRET FILE SCAN
-# ==============================================================
+$metadata = @"
+DAO Windows Desktop Backup
 
-function Remove-PotentialSecretFiles {
+Created:
+$(Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz")
 
-    param(
-        [Parameter(Mandatory)]
-        [string]$Root
-    )
+Runner:
+$env:RUNNER_NAME
 
-    if (-not (Test-Path -LiteralPath $Root)) {
-        return
-    }
+Repository:
+$env:GITHUB_REPOSITORY
 
-    $files = Get-ChildItem `
-        -LiteralPath $Root `
-        -File `
-        -Recurse `
-        -Force `
-        -ErrorAction SilentlyContinue
+Workflow:
+$env:GITHUB_WORKFLOW
 
-    foreach ($file in $files) {
+Run:
+$env:GITHUB_RUN_ID
 
-        $name = $file.Name.ToLowerInvariant()
+Workspace:
+$Workspace
 
-        if (
-            $name -match "github.*token" -or
-            $name -match "access.*token" -or
-            $name -match "vnc.*password" -or
-            $name -match "anydesk.*password" -or
-            $name -match "private.*key" -or
-            $name -match "secret"
-        ) {
+Files copied:
+$totalCopied
 
-            Write-BackupLog `
-                "Removing potentially sensitive file from artifact: $($file.FullName)" `
-                "WARN"
+Files failed:
+$totalFailed
 
-            Remove-Item `
-                -LiteralPath $file.FullName `
-                -Force `
-                -ErrorAction SilentlyContinue
-        }
-    }
-}
+Files skipped:
+$totalSkipped
 
+Passwords:
+NOT INCLUDED
 
-# ==============================================================
-# MAIN
-# ==============================================================
+GitHub credentials:
+NOT INCLUDED
+
+System profile:
+NOT INCLUDED
+
+Executable files:
+NOT INCLUDED
+"@
+
+Set-Content `
+    -LiteralPath (Join-Path $Payload "backup-metadata.txt") `
+    -Value $metadata
+
+# ============================================================
+# CREATE ZIP
+# ============================================================
+
+Remove-Item `
+    -LiteralPath $ZipFile `
+    -Force `
+    -ErrorAction SilentlyContinue
+
+Backup-Log "Creating ZIP backup..."
 
 try {
 
-    Write-BackupLog "============================================================"
-    Write-BackupLog "DAO backup starting."
-    Write-BackupLog "============================================================"
-
-    # ----------------------------------------------------------
-    # Clean previous staging
-    # ----------------------------------------------------------
-
-    if (Test-Path -LiteralPath $Staging) {
-
-        Remove-Item `
-            -LiteralPath $Staging `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-    }
-
-    New-Item `
-        -ItemType Directory `
-        -Path $Staging `
-        -Force | Out-Null
-
-    # ----------------------------------------------------------
-    # Destinations
-    # ----------------------------------------------------------
-
-    $workspaceDestination =
-        Join-Path $Staging "workspace"
-
-    $fileZillaDestination =
-        Join-Path $Staging "filezilla"
-
-    $geanyDestination =
-        Join-Path $Staging "geany"
-
-    $daoDataDestination =
-        Join-Path $Staging "dao-data"
-
-    $logsDestination =
-        Join-Path $Staging "logs"
-
-    $results = @()
-
-    # ----------------------------------------------------------
-    # Workspace
-    # ----------------------------------------------------------
-
-    $results += Backup-Tree `
-        -Source $Workspace `
-        -Destination $workspaceDestination `
-        -Label "DAO workspace"
-
-    # ----------------------------------------------------------
-    # FileZilla
-    # ----------------------------------------------------------
-
-    $results += Backup-Tree `
-        -Source $FileZilla `
-        -Destination $fileZillaDestination `
-        -Label "FileZilla configuration"
-
-    # ----------------------------------------------------------
-    # Geany
-    # ----------------------------------------------------------
-
-    $results += Backup-Tree `
-        -Source $Geany `
-        -Destination $geanyDestination `
-        -Label "Geany configuration"
-
-    # ----------------------------------------------------------
-    # DAO metadata
-    # ----------------------------------------------------------
-
-    New-Item `
-        -ItemType Directory `
-        -Path $daoDataDestination `
-        -Force | Out-Null
-
-    $metadata = @(
-        "Backup time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')",
-        "Repository: $env:GITHUB_REPOSITORY",
-        "Workflow: $env:GITHUB_WORKFLOW",
-        "Run ID: $env:GITHUB_RUN_ID",
-        "Runner OS: $env:RUNNER_OS",
-        "Workspace: $Workspace"
-    )
-
-    Set-Content `
-        -LiteralPath (
-            Join-Path `
-                $daoDataDestination `
-                "backup-metadata.txt"
-        ) `
-        -Value $metadata `
-        -Encoding UTF8
-
-    $results += $true
-
-    # ----------------------------------------------------------
-    # Logs
-    # ----------------------------------------------------------
-
-    $results += Backup-Tree `
-        -Source $Logs `
-        -Destination $logsDestination `
-        -Label "DAO logs"
-
-    # ----------------------------------------------------------
-    # Remove temporary files
-    # ----------------------------------------------------------
-
-    Remove-TemporaryFiles `
-        -Root $Staging
-
-    # ----------------------------------------------------------
-    # Remove obvious secret files
-    # ----------------------------------------------------------
-
-    Remove-PotentialSecretFiles `
-        -Root $Staging
-
-    # ----------------------------------------------------------
-    # Verify backup
-    # ----------------------------------------------------------
-
-    $entries = Get-ChildItem `
-        -LiteralPath $Staging `
+    Compress-Archive `
+        -Path (Join-Path $Payload "*") `
+        -DestinationPath $ZipFile `
+        -CompressionLevel Optimal `
         -Force `
-        -ErrorAction SilentlyContinue
+        -ErrorAction Stop
 
-    if ($null -eq $entries -or @($entries).Count -eq 0) {
-
-        Write-BackupLog `
-            "Backup staging directory is empty." `
-            "ERROR"
-
-        Set-Content `
-            -LiteralPath (
-                Join-Path $Logs "backup-status.txt"
-            ) `
-            -Value "Backup failed" `
-            -Encoding UTF8
-
-        exit 1
-    }
-
-    $failed = @(
-        $results |
-        Where-Object { $_ -eq $false }
-    ).Count
-
-    if ($failed -eq 0) {
-
-        $status = "Backup completed successfully"
-
-        Write-BackupLog $status
-    }
-    else {
-
-        $status = "Backup completed with warnings"
-
-        Write-BackupLog `
-            $status `
-            "WARN"
-    }
-
-    Set-Content `
-        -LiteralPath (
-            Join-Path $Logs "backup-status.txt"
-        ) `
-        -Value $status `
-        -Encoding UTF8
-
-    Write-BackupLog `
-        "Backup staging: $Staging"
-
-    Write-BackupLog `
-        "Backup completed."
 }
 catch {
 
-    Write-BackupLog `
-        "Unexpected backup exception: $($_.Exception.Message)" `
-        "ERROR"
+    Backup-Log "ERROR: ZIP creation failed: $($_.Exception.Message)"
 
-    Set-Content `
-        -LiteralPath (
-            Join-Path $Logs "backup-status.txt"
-        ) `
-        -Value "Backup completed with warnings" `
-        -Encoding UTF8
-
-    exit 1
+    throw
 }
+
+# ============================================================
+# VALIDATE ZIP
+# ============================================================
+
+try {
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipFile)
+
+    try {
+
+        if ($zip.Entries.Count -eq 0) {
+            throw "Backup ZIP contains no files."
+        }
+
+        Backup-Log "ZIP validation successful."
+        Backup-Log "ZIP entries: $($zip.Entries.Count)"
+    }
+    finally {
+
+        $zip.Dispose()
+    }
+
+}
+catch {
+
+    Backup-Log "ERROR: Backup ZIP validation failed: $($_.Exception.Message)"
+
+    throw
+}
+
+# ============================================================
+# STATUS
+# ============================================================
+
+if ($totalFailed -eq 0) {
+
+    $status = "Backup completed successfully"
+
+}
+else {
+
+    $status = "Backup completed with warnings"
+}
+
+Set-Content `
+    -LiteralPath (Join-Path $Logs "backup-status.txt") `
+    -Value $status
+
+Backup-Log ""
+Backup-Log "=============================================="
+Backup-Log $status
+Backup-Log "=============================================="
+Backup-Log "Files copied : $totalCopied"
+Backup-Log "Files skipped: $totalSkipped"
+Backup-Log "Files failed : $totalFailed"
+Backup-Log "Backup file  : $ZipFile"
+Backup-Log "=============================================="
+
+Write-Host ""
+Write-Host $status
+Write-Host ""
+Write-Host "Backup file:"
+Write-Host $ZipFile
