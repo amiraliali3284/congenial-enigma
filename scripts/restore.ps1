@@ -1,44 +1,105 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$RestoreRoot   = "D:\DAO-Restore",
+    [string]$WorkspaceRoot = "D:\DAO-Workspace",
+    [string]$LogsRoot      = "D:\DAO-Logs"
+)
 
 Set-StrictMode -Version Latest
-
 $ErrorActionPreference = "Continue"
 
-$Workspace = "D:\DAO-Workspace"
-$Logs      = "D:\DAO-Logs"
+# ============================================================
+# PATHS
+# ============================================================
 
-$RestoreLog = Join-Path $Logs "restore.log"
-$TempRoot   = Join-Path $env:RUNNER_TEMP "dao-restore"
+$Workspace = $WorkspaceRoot
+$Logs      = $LogsRoot
+$Restore   = $RestoreRoot
+
+$RestoreLog   = Join-Path $Logs "restore.log"
+$StatusFile   = Join-Path $Logs "restore-status.txt"
+$TempRoot     = Join-Path $env:RUNNER_TEMP "dao-restore"
+$ArtifactZip  = Join-Path $TempRoot "backup.zip"
+$ExtractDir   = Join-Path $TempRoot "extracted"
+
+# ============================================================
+# INITIALIZE DIRECTORIES
+# ============================================================
 
 New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
-New-Item -ItemType Directory -Force -Path $Logs | Out-Null
+New-Item -ItemType Directory -Force -Path $Logs      | Out-Null
+New-Item -ItemType Directory -Force -Path $Restore   | Out-Null
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 function Restore-Log {
-    param([string]$Message)
+    param(
+        [string]$Message
+    )
 
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
 
     Write-Host $line
 
     try {
-        Add-Content -LiteralPath $RestoreLog -Value $line
+        Add-Content `
+            -LiteralPath $RestoreLog `
+            -Value $line `
+            -ErrorAction SilentlyContinue
     }
     catch {
     }
 }
 
+function Set-Restore-Status {
+    param(
+        [string]$Status
+    )
+
+    try {
+        Set-Content `
+            -LiteralPath $StatusFile `
+            -Value $Status `
+            -Encoding UTF8 `
+            -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+}
+
+# ============================================================
+# SAFE TREE COPY
+#
+# Only user/data files are restored.
+# Executables, scripts and potentially executable content are
+# intentionally excluded.
+# ============================================================
+
 function Copy-SafeTree {
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Source,
+
+        [Parameter(Mandatory = $true)]
         [string]$Destination
     )
 
-    if (-not (Test-Path $Source)) {
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+        Restore-Log "Source does not exist: $Source"
         return
     }
 
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $Destination |
+        Out-Null
+
+    # --------------------------------------------------------
+    # Files that should not be restored from an artifact.
+    # --------------------------------------------------------
 
     $dangerousExtensions = @(
         ".exe",
@@ -50,11 +111,14 @@ function Copy-SafeTree {
         ".dll",
         ".ocx",
         ".cpl",
+
         ".bat",
         ".cmd",
+
         ".ps1",
         ".psm1",
         ".psd1",
+
         ".vbs",
         ".vbe",
         ".js",
@@ -78,68 +142,112 @@ function Copy-SafeTree {
         "My Videos"
     )
 
-    Get-ChildItem `
+    $files = Get-ChildItem `
         -LiteralPath $Source `
         -Force `
         -Recurse `
         -File `
-        -ErrorAction SilentlyContinue |
-        ForEach-Object {
+        -ErrorAction SilentlyContinue
 
-            $file = $_
+    foreach ($file in $files) {
 
-            try {
+        try {
 
-                $relative = $file.FullName.Substring(
-                    $Source.TrimEnd('\').Length
-                ).TrimStart('\')
+            # ------------------------------------------------
+            # Calculate relative path.
+            # ------------------------------------------------
 
-                $parts = $relative -split '[\\/]'
+            $sourceRoot = $Source.TrimEnd('\')
 
-                $skipDirectory = $false
+            $relative = $file.FullName.Substring(
+                $sourceRoot.Length
+            ).TrimStart('\')
 
-                foreach ($part in $parts) {
-
-                    if ($excludedDirectoryNames -contains $part) {
-                        $skipDirectory = $true
-                        break
-                    }
-                }
-
-                if ($skipDirectory) {
-                    return
-                }
-
-                if ($dangerousExtensions -contains $file.Extension.ToLowerInvariant()) {
-                    return
-                }
-
-                $target = Join-Path $Destination $relative
-
-                $targetDir = Split-Path $target -Parent
-
-                New-Item `
-                    -ItemType Directory `
-                    -Force `
-                    -Path $targetDir |
-                    Out-Null
-
-                Copy-Item `
-                    -LiteralPath $file.FullName `
-                    -Destination $target `
-                    -Force `
-                    -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($relative)) {
+                continue
             }
-            catch {
 
-                Restore-Log "WARNING: could not restore $($file.FullName): $($_.Exception.Message)"
+            # ------------------------------------------------
+            # Check directory names.
+            # ------------------------------------------------
+
+            $parts = $relative -split '[\\/]'
+
+            $skipDirectory = $false
+
+            foreach ($part in $parts) {
+
+                if ($excludedDirectoryNames -contains $part) {
+                    $skipDirectory = $true
+                    break
+                }
             }
+
+            if ($skipDirectory) {
+                continue
+            }
+
+            # ------------------------------------------------
+            # Check dangerous extension.
+            # ------------------------------------------------
+
+            $extension = $file.Extension.ToLowerInvariant()
+
+            if ($dangerousExtensions -contains $extension) {
+                continue
+            }
+
+            # ------------------------------------------------
+            # Destination.
+            # ------------------------------------------------
+
+            $target = Join-Path `
+                $Destination `
+                $relative
+
+            $targetDirectory = Split-Path `
+                -Path $target `
+                -Parent
+
+            New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path $targetDirectory |
+                Out-Null
+
+            # ------------------------------------------------
+            # Copy.
+            # ------------------------------------------------
+
+            Copy-Item `
+                -LiteralPath $file.FullName `
+                -Destination $target `
+                -Force `
+                -ErrorAction Stop
         }
+        catch {
+
+            Restore-Log `
+                "WARNING: Could not restore '$($file.FullName)': $($_.Exception.Message)"
+        }
+    }
 }
+
+# ============================================================
+# START
+# ============================================================
 
 Restore-Log "=============================================="
 Restore-Log "DAO RESTORE START"
 Restore-Log "=============================================="
+
+Restore-Log "Restore root: $Restore"
+Restore-Log "Workspace:    $Workspace"
+Restore-Log "Logs:         $Logs"
+
+# ============================================================
+# GITHUB TOKEN
+# ============================================================
 
 $token = [Environment]::GetEnvironmentVariable("GH_TOKEN")
 
@@ -148,25 +256,43 @@ if ([string]::IsNullOrWhiteSpace($token)) {
     Restore-Log "GH_TOKEN is not available."
     Restore-Log "No artifact restore can be performed."
 
-    Set-Content `
-        -LiteralPath (Join-Path $Logs "restore-status.txt") `
-        -Value "NO TOKEN - NO RESTORE"
+    Set-Restore-Status "NO TOKEN - NO RESTORE"
 
     exit 0
 }
 
-$repo = $env:GITHUB_REPOSITORY
+# ============================================================
+# REPOSITORY
+# ============================================================
+
+$repo = [Environment]::GetEnvironmentVariable("GITHUB_REPOSITORY")
 
 if ([string]::IsNullOrWhiteSpace($repo)) {
 
     Restore-Log "GITHUB_REPOSITORY is not available."
 
-    Set-Content `
-        -LiteralPath (Join-Path $Logs "restore-status.txt") `
-        -Value "NO REPOSITORY - NO RESTORE"
+    Set-Restore-Status "NO REPOSITORY - NO RESTORE"
 
     exit 0
 }
+
+Restore-Log "Repository: $repo"
+
+# ============================================================
+# GH CLI
+# ============================================================
+
+$gh = Get-Command gh.exe -ErrorAction SilentlyContinue
+
+if (-not $gh) {
+
+    Restore-Log "GitHub CLI (gh.exe) was not found."
+    Set-Restore-Status "GH CLI NOT FOUND"
+
+    exit 0
+}
+
+Restore-Log "GitHub CLI: $($gh.Source)"
 
 # ============================================================
 # CLEAN TEMP
@@ -184,20 +310,23 @@ New-Item `
     -Path $TempRoot |
     Out-Null
 
-$artifactZip = Join-Path $TempRoot "backup.zip"
-$extractDir  = Join-Path $TempRoot "extracted"
+New-Item `
+    -ItemType Directory `
+    -Force `
+    -Path $ExtractDir |
+    Out-Null
 
 # ============================================================
-# FIND ARTIFACTS
+# FIND PREVIOUS ARTIFACT
 # ============================================================
 
-Restore-Log "Searching for previous dao-windows-backup artifacts..."
+Restore-Log "Searching for previous dao-windows-backup artifact..."
 
 $artifactList = $null
 
 try {
 
-    $json = & gh api `
+    $json = & $gh.Source api `
         "repos/$repo/actions/artifacts?per_page=100" `
         --header "Accept: application/vnd.github+json" `
         --header "X-GitHub-Api-Version: 2022-11-28" `
@@ -205,28 +334,55 @@ try {
 
     if ($LASTEXITCODE -ne 0) {
 
-        Restore-Log "gh api failed."
-        Restore-Log "$json"
+        Restore-Log "GitHub artifact API request failed."
+
+        if ($json) {
+            Restore-Log (($json | Out-String).Trim())
+        }
+
+        Set-Restore-Status "ARTIFACT API FAILED"
 
         exit 0
     }
 
-    if ($json) {
-        $artifactList = ($json -join "`n") | ConvertFrom-Json
+    if ($null -eq $json) {
+        Restore-Log "GitHub returned an empty response."
+        Set-Restore-Status "EMPTY ARTIFACT RESPONSE"
+        exit 0
     }
 
+    $jsonText = ($json -join "`n")
+
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        Restore-Log "GitHub returned an empty JSON response."
+        Set-Restore-Status "EMPTY ARTIFACT RESPONSE"
+        exit 0
+    }
+
+    $artifactList = $jsonText | ConvertFrom-Json
 }
 catch {
 
-    Restore-Log "Artifact API query failed: $($_.Exception.Message)"
+    Restore-Log `
+        "Artifact API query failed: $($_.Exception.Message)"
+
+    Set-Restore-Status "ARTIFACT API FAILED"
+
     exit 0
 }
 
 if ($null -eq $artifactList) {
 
-    Restore-Log "No artifact response."
+    Restore-Log "No artifact response was received."
+
+    Set-Restore-Status "NO ARTIFACT RESPONSE"
+
     exit 0
 }
+
+# ============================================================
+# SELECT ARTIFACT
+# ============================================================
 
 $artifacts = @(
     $artifactList.artifacts |
@@ -243,61 +399,126 @@ if ($artifacts.Count -eq 0) {
 
     Restore-Log "No previous DAO backup artifact was found."
 
-    Set-Content `
-        -LiteralPath (Join-Path $Logs "restore-status.txt") `
-        -Value "NO PREVIOUS BACKUP"
+    Set-Restore-Status "NO PREVIOUS BACKUP"
 
     exit 0
 }
 
-$selected = $artifacts[0]
+# ------------------------------------------------------------
+# Prefer an artifact that is not from the current run.
+# ------------------------------------------------------------
 
-Restore-Log "Selected artifact:"
-Restore-Log "ID: $($selected.id)"
-Restore-Log "Created: $($selected.created_at)"
-Restore-Log "Size: $($selected.size_in_bytes) bytes"
+$currentRunId = [Environment]::GetEnvironmentVariable("GITHUB_RUN_ID")
+
+$selected = $null
+
+foreach ($artifact in $artifacts) {
+
+    $candidateRunId = ""
+
+    try {
+        $candidateRunId = [string]$artifact.workflow_run.id
+    }
+    catch {
+        $candidateRunId = ""
+    }
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($currentRunId) -and
+        $candidateRunId -eq $currentRunId
+    ) {
+        continue
+    }
+
+    $selected = $artifact
+    break
+}
+
+if ($null -eq $selected) {
+    $selected = $artifacts[0]
+}
+
+Restore-Log "Previous backup selected."
+
+Restore-Log "Artifact ID: $($selected.id)"
+Restore-Log "Name:        $($selected.name)"
+Restore-Log "Created:     $($selected.created_at)"
+Restore-Log "Size:        $($selected.size_in_bytes) bytes"
+
+try {
+    Restore-Log "Workflow run: $($selected.workflow_run.id)"
+}
+catch {
+}
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD ARTIFACT
+#
+# IMPORTANT:
+# Use gh api --output rather than PowerShell stdout redirection.
+# This avoids corrupting binary ZIP data.
 # ============================================================
 
-Restore-Log "Downloading artifact..."
+Restore-Log "Downloading DAO backup artifact..."
 
 try {
 
-    & gh api `
+    & $gh.Source api `
         "repos/$repo/actions/artifacts/$($selected.id)/zip" `
         --header "Accept: application/vnd.github+json" `
         --header "X-GitHub-Api-Version: 2022-11-28" `
-        > $artifactZip
+        --output $ArtifactZip
 
     if ($LASTEXITCODE -ne 0) {
         throw "gh api returned exit code $LASTEXITCODE"
     }
-
 }
 catch {
 
-    Restore-Log "Artifact download failed: $($_.Exception.Message)"
+    Restore-Log `
+        "Artifact download failed: $($_.Exception.Message)"
 
-    Set-Content `
-        -LiteralPath (Join-Path $Logs "restore-status.txt") `
-        -Value "DOWNLOAD FAILED"
+    Set-Restore-Status "DOWNLOAD FAILED"
 
     exit 0
 }
 
-if (-not (Test-Path $artifactZip)) {
+# ============================================================
+# CHECK DOWNLOADED ZIP
+# ============================================================
+
+if (-not (Test-Path -LiteralPath $ArtifactZip -PathType Leaf)) {
 
     Restore-Log "Downloaded ZIP does not exist."
+
+    Set-Restore-Status "ZIP NOT FOUND"
+
     exit 0
 }
 
-$fileInfo = Get-Item $artifactZip
+try {
 
-if ($fileInfo.Length -lt 100) {
+    $fileInfo = Get-Item `
+        -LiteralPath $ArtifactZip `
+        -ErrorAction Stop
 
-    Restore-Log "Downloaded artifact appears invalid or empty."
+    Restore-Log "Downloaded ZIP size: $($fileInfo.Length) bytes"
+
+    if ($fileInfo.Length -lt 100) {
+
+        Restore-Log "Downloaded ZIP appears empty or invalid."
+
+        Set-Restore-Status "INVALID ZIP"
+
+        exit 0
+    }
+}
+catch {
+
+    Restore-Log "Could not inspect downloaded ZIP."
+
+    Set-Restore-Status "ZIP INSPECTION FAILED"
+
     exit 0
 }
 
@@ -305,13 +526,17 @@ if ($fileInfo.Length -lt 100) {
 # VALIDATE ZIP
 # ============================================================
 
-Restore-Log "Validating backup ZIP..."
+Restore-Log "Validating ZIP contents..."
 
 try {
 
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    Add-Type `
+        -AssemblyName System.IO.Compression.FileSystem `
+        -ErrorAction SilentlyContinue
 
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($artifactZip)
+    $zip = [System.IO.Compression.ZipFile]::OpenRead(
+        $ArtifactZip
+    )
 
     try {
 
@@ -323,29 +548,34 @@ try {
 
             $fullName = $entry.FullName.Replace("\", "/")
 
-            if ($fullName.StartsWith("/") -or
-                $fullName.Contains("../") -or
-                $fullName.StartsWith("../")) {
+            # --------------------------------------------
+            # Prevent path traversal.
+            # --------------------------------------------
 
+            if (
+                $fullName.StartsWith("/") -or
+                $fullName.StartsWith("../") -or
+                $fullName.Contains("/../") -or
+                $fullName.Contains(":/")
+            ) {
                 throw "Unsafe ZIP path detected: $fullName"
             }
         }
 
         Restore-Log "ZIP validation successful."
+        Restore-Log "ZIP entries: $($zip.Entries.Count)"
     }
     finally {
 
         $zip.Dispose()
     }
-
 }
 catch {
 
-    Restore-Log "ZIP validation failed: $($_.Exception.Message)"
+    Restore-Log `
+        "ZIP validation failed: $($_.Exception.Message)"
 
-    Set-Content `
-        -LiteralPath (Join-Path $Logs "restore-status.txt") `
-        -Value "INVALID ZIP"
+    Set-Restore-Status "INVALID ZIP"
 
     exit 0
 }
@@ -354,56 +584,111 @@ catch {
 # EXTRACT
 # ============================================================
 
-Restore-Log "Extracting backup..."
+Restore-Log "Extracting backup ZIP..."
 
 try {
 
     Expand-Archive `
-        -LiteralPath $artifactZip `
-        -DestinationPath $extractDir `
+        -LiteralPath $ArtifactZip `
+        -DestinationPath $ExtractDir `
         -Force `
         -ErrorAction Stop
 
+    Restore-Log "ZIP extraction completed."
 }
 catch {
 
-    Restore-Log "ZIP extraction failed: $($_.Exception.Message)"
+    Restore-Log `
+        "ZIP extraction failed: $($_.Exception.Message)"
+
+    Set-Restore-Status "EXTRACTION FAILED"
+
     exit 0
 }
 
 # ============================================================
-# FIND PAYLOAD
+# SHOW EXTRACTED STRUCTURE
 # ============================================================
 
-$payload = Join-Path $extractDir "DAO-Backup"
+Restore-Log "Inspecting extracted backup..."
 
-if (-not (Test-Path $payload)) {
+try {
 
-    # Handle a possible extra root directory.
-    $candidate = Get-ChildItem `
-        -LiteralPath $extractDir `
-        -Directory `
+    Get-ChildItem `
+        -LiteralPath $ExtractDir `
+        -Force `
+        -Recurse `
         -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+        Select-Object `
+            FullName,
+            Length,
+            PSIsContainer |
+        Format-Table -AutoSize |
+        Out-String -Width 240 |
+        ForEach-Object {
+            Restore-Log $_
+        }
+}
+catch {
+}
 
-    if ($candidate) {
-        $payload = $candidate.FullName
+# ============================================================
+# LOCATE BACKUP PAYLOAD
+#
+# upload-artifact can produce slightly different root layouts.
+# We therefore locate workspace/FileZilla/Geany/dao-data
+# recursively instead of assuming one exact root directory.
+# ============================================================
+
+function Find-BackupDirectory {
+    param(
+        [string]$Root,
+        [string]$DirectoryName
+    )
+
+    # First try direct child.
+    $direct = Join-Path $Root $DirectoryName
+
+    if (Test-Path -LiteralPath $direct -PathType Container) {
+        return $direct
     }
-}
 
-if (-not (Test-Path $payload)) {
+    # Then recursively search.
+    try {
 
-    Restore-Log "Backup payload was not found."
-    exit 0
+        $found = Get-ChildItem `
+            -LiteralPath $Root `
+            -Directory `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq $DirectoryName
+            } |
+            Select-Object -First 1
+
+        if ($found) {
+            return $found.FullName
+        }
+    }
+    catch {
+    }
+
+    return $null
 }
 
 # ============================================================
-# RESTORE WORKSPACE
+# FIND WORKSPACE
 # ============================================================
 
-$workspaceBackup = Join-Path $payload "workspace"
+$workspaceBackup = Find-BackupDirectory `
+    -Root $ExtractDir `
+    -DirectoryName "workspace"
 
-if (Test-Path $workspaceBackup) {
+if ($workspaceBackup) {
+
+    Restore-Log "Workspace backup found:"
+    Restore-Log $workspaceBackup
 
     Restore-Log "Restoring DAO workspace..."
 
@@ -412,7 +697,6 @@ if (Test-Path $workspaceBackup) {
         -Destination $Workspace
 
     Restore-Log "Workspace restore completed."
-
 }
 else {
 
@@ -420,14 +704,26 @@ else {
 }
 
 # ============================================================
-# RESTORE FILEZILLA
+# FILEZILLA
 # ============================================================
 
-$filezillaBackup = Join-Path $payload "FileZilla"
+$filezillaBackup = Find-BackupDirectory `
+    -Root $ExtractDir `
+    -DirectoryName "FileZilla"
 
-if (Test-Path $filezillaBackup) {
+if ($filezillaBackup) {
 
-    $filezillaDestination = Join-Path $env:APPDATA "FileZilla"
+    $filezillaDestination = Join-Path `
+        $env:APPDATA `
+        "FileZilla"
+
+    Restore-Log "FileZilla backup found."
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $filezillaDestination |
+        Out-Null
 
     Restore-Log "Restoring FileZilla configuration..."
 
@@ -437,16 +733,32 @@ if (Test-Path $filezillaBackup) {
 
     Restore-Log "FileZilla restore completed."
 }
+else {
+
+    Restore-Log "No FileZilla configuration in backup."
+}
 
 # ============================================================
-# RESTORE GEANY
+# GEANY
 # ============================================================
 
-$geanyBackup = Join-Path $payload "Geany"
+$geanyBackup = Find-BackupDirectory `
+    -Root $ExtractDir `
+    -DirectoryName "Geany"
 
-if (Test-Path $geanyBackup) {
+if ($geanyBackup) {
 
-    $geanyDestination = Join-Path $env:APPDATA "geany"
+    $geanyDestination = Join-Path `
+        $env:APPDATA `
+        "geany"
+
+    Restore-Log "Geany backup found."
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $geanyDestination |
+        Out-Null
 
     Restore-Log "Restoring Geany configuration..."
 
@@ -456,14 +768,22 @@ if (Test-Path $geanyBackup) {
 
     Restore-Log "Geany restore completed."
 }
+else {
+
+    Restore-Log "No Geany configuration in backup."
+}
 
 # ============================================================
-# RESTORE DAO DATA
+# DAO DATA
 # ============================================================
 
-$daoDataBackup = Join-Path $payload "dao-data"
+$daoDataBackup = Find-BackupDirectory `
+    -Root $ExtractDir `
+    -DirectoryName "dao-data"
 
-if (Test-Path $daoDataBackup) {
+if ($daoDataBackup) {
+
+    Restore-Log "DAO-specific data backup found."
 
     Restore-Log "Restoring DAO-specific data..."
 
@@ -473,23 +793,90 @@ if (Test-Path $daoDataBackup) {
 
     Restore-Log "DAO-specific data restore completed."
 }
+else {
+
+    Restore-Log "No DAO-specific data directory in backup."
+}
 
 # ============================================================
-# RESTORE STATUS
+# RESTORE METADATA
 # ============================================================
 
-$statusFile = Join-Path $Logs "restore-status.txt"
+$metadataBackup = Find-BackupDirectory `
+    -Root $ExtractDir `
+    -DirectoryName "metadata"
 
-Set-Content `
-    -LiteralPath $statusFile `
-    -Value "RESTORE COMPLETED"
+if ($metadataBackup) {
+
+    $metadataDestination = Join-Path `
+        $Workspace `
+        ".dao-metadata"
+
+    Restore-Log "Restoring DAO metadata..."
+
+    Copy-SafeTree `
+        -Source $metadataBackup `
+        -Destination $metadataDestination
+
+    Restore-Log "DAO metadata restore completed."
+}
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+$workspaceExists = Test-Path `
+    -LiteralPath $Workspace `
+    -PathType Container
+
+$workspaceFileCount = 0
+
+if ($workspaceExists) {
+
+    try {
+
+        $workspaceFileCount = @(
+            Get-ChildItem `
+                -LiteralPath $Workspace `
+                -Recurse `
+                -File `
+                -ErrorAction SilentlyContinue
+        ).Count
+    }
+    catch {
+        $workspaceFileCount = 0
+    }
+}
+
+# ============================================================
+# STATUS
+# ============================================================
+
+Set-Restore-Status `
+    "RESTORE COMPLETED`r`nWorkspace files restored/present: $workspaceFileCount"
 
 Restore-Log "=============================================="
 Restore-Log "DAO RESTORE COMPLETED"
 Restore-Log "=============================================="
 
-Remove-Item `
-    -LiteralPath $TempRoot `
-    -Recurse `
-    -Force `
-    -ErrorAction SilentlyContinue
+Restore-Log "Workspace: $Workspace"
+Restore-Log "Files currently present: $workspaceFileCount"
+
+# ============================================================
+# CLEAN TEMP
+# ============================================================
+
+try {
+
+    Remove-Item `
+        -LiteralPath $TempRoot `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
+}
+catch {
+}
+
+Restore-Log "Temporary restore files cleaned."
+
+Restore-Log "DAO restore process finished."
