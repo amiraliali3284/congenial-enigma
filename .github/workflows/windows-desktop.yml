@@ -39,9 +39,10 @@ jobs:
           Write-Host "=============================================="
           Write-Host "        DAO WINDOWS DESKTOP"
           Write-Host "=============================================="
-          Write-Host "Workspace : $env:WORKSPACE"
-          Write-Host "Backup    : $env:BACKUP"
-          Write-Host "Logs      : $env:LOGDIR"
+          Write-Host "Windows: Windows 2025 Runner"
+          Write-Host "Workspace: $env:WORKSPACE"
+          Write-Host "Backup: $env:BACKUP"
+          Write-Host "Logs: $env:LOGDIR"
           Write-Host "=============================================="
 
       # ============================================================
@@ -54,7 +55,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
           $headers = @{
             Accept = "application/vnd.github+json"
@@ -62,16 +63,20 @@ jobs:
             "X-GitHub-Api-Version" = "2022-11-28"
           }
 
-          $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts?name=dao-windows-backup&per_page=100"
+          $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100"
 
           try {
+
             $response = Invoke-RestMethod `
               -Uri $url `
               -Headers $headers `
               -Method Get
 
             $artifact = $response.artifacts |
-              Where-Object { $_.expired -eq $false } |
+              Where-Object {
+                $_.name -eq "dao-windows-backup" -and
+                $_.expired -eq $false
+              } |
               Sort-Object created_at -Descending |
               Select-Object -First 1
 
@@ -90,10 +95,11 @@ jobs:
               "artifact_id=" |
                 Out-File $env:GITHUB_OUTPUT -Append
             }
+
           }
           catch {
 
-            Write-Warning "Artifact lookup failed."
+            Write-Warning "Could not find previous backup."
             Write-Warning $_
 
             "artifact_id=" |
@@ -101,7 +107,7 @@ jobs:
           }
 
       # ============================================================
-      # 3. RESTORE BACKUP
+      # 3. RESTORE
       # ============================================================
 
       - name: Restore previous backup
@@ -110,7 +116,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
           $artifactId = "${{ steps.previous.outputs.artifact_id }}"
 
@@ -122,25 +128,53 @@ jobs:
 
           $zip = "$env:TEMP\dao-backup.zip"
 
-          Write-Host "Downloading previous backup..."
+          Write-Host "Downloading backup..."
 
-          Invoke-WebRequest `
-            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$artifactId/zip" `
-            -Headers $headers `
-            -OutFile $zip
+          try {
 
-          Write-Host "Extracting..."
+            Invoke-WebRequest `
+              -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$artifactId/zip" `
+              -Headers $headers `
+              -OutFile $zip `
+              -UseBasicParsing
+
+          }
+          catch {
+
+            Write-Warning "Backup download failed."
+            Write-Warning $_
+            exit 0
+          }
+
+          if (!(Test-Path $zip)) {
+            Write-Warning "Backup ZIP not found."
+            exit 0
+          }
+
+          $extract = "$env:TEMP\dao-restore"
+
+          Remove-Item `
+            $extract `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $extract |
+            Out-Null
 
           Expand-Archive `
             -Path $zip `
-            -DestinationPath $env:BACKUP `
+            -DestinationPath $extract `
             -Force
 
           # Workspace
-          if (Test-Path "$env:BACKUP\workspace") {
+          if (Test-Path "$extract\workspace") {
 
             Get-ChildItem `
-              "$env:BACKUP\workspace" `
+              "$extract\workspace" `
               -Force `
               -ErrorAction SilentlyContinue |
             ForEach-Object {
@@ -155,7 +189,7 @@ jobs:
           }
 
           # FileZilla
-          if (Test-Path "$env:BACKUP\FileZilla") {
+          if (Test-Path "$extract\FileZilla") {
 
             New-Item `
               -ItemType Directory `
@@ -164,17 +198,21 @@ jobs:
               Out-Null
 
             Get-ChildItem `
-              "$env:BACKUP\FileZilla" `
+              "$extract\FileZilla" `
               -Force |
-            Copy-Item `
-              -Destination "$env:APPDATA\FileZilla" `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
+            ForEach-Object {
+
+              Copy-Item `
+                -LiteralPath $_.FullName `
+                -Destination "$env:APPDATA\FileZilla" `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+            }
           }
 
           # Geany
-          if (Test-Path "$env:BACKUP\Geany") {
+          if (Test-Path "$extract\Geany") {
 
             New-Item `
               -ItemType Directory `
@@ -183,19 +221,23 @@ jobs:
               Out-Null
 
             Get-ChildItem `
-              "$env:BACKUP\Geany" `
+              "$extract\Geany" `
               -Force |
-            Copy-Item `
-              -Destination "$env:APPDATA\geany" `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
+            ForEach-Object {
+
+              Copy-Item `
+                -LiteralPath $_.FullName `
+                -Destination "$env:APPDATA\geany" `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+            }
           }
 
           Write-Host "Restore completed."
 
       # ============================================================
-      # 4. INSTALL FILEZILLA + GEANY
+      # 4. INSTALL APPLICATIONS
       # ============================================================
 
       - name: Install FileZilla and Geany
@@ -221,7 +263,7 @@ jobs:
             --accept-source-agreements `
             --accept-package-agreements
 
-          Write-Host "Applications installed."
+          Write-Host "FileZilla and Geany ready."
 
       # ============================================================
       # 5. INSTALL TIGHTVNC
@@ -239,7 +281,7 @@ jobs:
           }
 
           if ($env:VNC_PASSWORD.Length -lt 6) {
-            throw "VNC_PASSWORD must contain at least 6 characters."
+            throw "VNC_PASSWORD must be at least 6 characters."
           }
 
           Write-Host "Downloading TightVNC..."
@@ -257,7 +299,7 @@ jobs:
 
           Write-Host "Installing TightVNC..."
 
-          $args = @(
+          $arguments = @(
             "/i"
             "`"$installer`""
             "/quiet"
@@ -269,21 +311,24 @@ jobs:
             "VALUE_OF_USEVNCAUTHENTICATION=1"
             "SET_PASSWORD=1"
             "VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
-            "SET_USECONTROLAUTHENTICATION=1"
-            "VALUE_OF_USECONTROLAUTHENTICATION=1"
-            "SET_CONTROLPASSWORD=1"
-            "VALUE_OF_CONTROLPASSWORD=$env:VNC_PASSWORD"
           )
 
-          Start-Process `
+          $install = Start-Process `
             msiexec.exe `
-            -ArgumentList $args `
-            -Wait
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru
 
-          Write-Host "TightVNC installed and configured."
+          Write-Host "MSI Exit Code: $($install.ExitCode)"
+
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+            throw "TightVNC installation failed."
+          }
+
+          Write-Host "TightVNC installed."
 
       # ============================================================
-      # 6. START VNC
+      # 6. START TIGHTVNC
       # ============================================================
 
       - name: Start TightVNC
@@ -298,7 +343,7 @@ jobs:
           }
 
           if (!(Test-Path $vnc)) {
-            throw "TightVNC server executable not found."
+            throw "TightVNC server not found."
           }
 
           Write-Host "Starting TightVNC..."
@@ -307,13 +352,17 @@ jobs:
 
           Start-Sleep -Seconds 5
 
-          Get-Service |
-            Where-Object {
-              $_.Name -match "tvn|tight"
-            } |
-            Format-Table -AutoSize
+          $port = Get-NetTCPConnection `
+            -LocalPort 5900 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
 
-          Write-Host "VNC is running on TCP 5900."
+          if ($port) {
+            Write-Host "TightVNC is listening on TCP 5900."
+          }
+          else {
+            Write-Warning "TCP 5900 is not detected yet."
+          }
 
       # ============================================================
       # 7. INSTALL ANYDESK
@@ -339,6 +388,10 @@ jobs:
             -OutFile $installer `
             -UseBasicParsing
 
+          if (!(Test-Path $installer)) {
+            throw "AnyDesk download failed."
+          }
+
           Write-Host "Installing AnyDesk..."
 
           Start-Process `
@@ -363,16 +416,17 @@ jobs:
 
           Start-Sleep -Seconds 8
 
-          # Unattended Access
+          Write-Host "Configuring AnyDesk..."
+
           $env:ANYDESK_PASSWORD |
             & $anydesk --set-password _unattended_access
 
           Start-Sleep -Seconds 3
 
-          Write-Host "AnyDesk configured."
+          Write-Host "AnyDesk ready."
 
       # ============================================================
-      # 8. GET ANYDESK ID
+      # 8. ANYDESK ID
       # ============================================================
 
       - name: Get AnyDesk ID
@@ -386,28 +440,35 @@ jobs:
             $anydesk = "C:\Program Files\AnyDesk\AnyDesk.exe"
           }
 
-          if (Test-Path $anydesk) {
-
-            Start-Sleep -Seconds 5
-
-            $id = & $anydesk --get-id 2>$null |
-              Out-String
-
-            $id = $id.Trim()
-
-            Set-Content `
-              "$env:LOGDIR\anydesk-id.txt" `
-              $id
-
-            Write-Host ""
-            Write-Host "AnyDesk ID: $id"
+          if (!(Test-Path $anydesk)) {
+            Write-Warning "AnyDesk executable not found."
+            exit 0
           }
 
+          Start-Sleep -Seconds 5
+
+          $id = & $anydesk --get-id 2>$null |
+            Out-String
+
+          $id = $id.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($id)) {
+            $id = "Unavailable"
+          }
+
+          Set-Content `
+            "$env:LOGDIR\anydesk-id.txt" `
+            $id
+
+          Write-Host ""
+          Write-Host "AnyDesk ID:"
+          Write-Host $id
+
       # ============================================================
-      # 9. INSTALL PYTHON PACKAGES FOR NOVNC
+      # 9. DOWNLOAD NOVNC
       # ============================================================
 
-      - name: Install noVNC and websockify
+      - name: Install noVNC
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -415,24 +476,44 @@ jobs:
           Write-Host "Downloading noVNC..."
 
           $zip = "$env:TEMP\novnc.zip"
+          $extract = "$env:TEMP\novnc-extract"
+
+          Remove-Item `
+            $extract `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
 
           Invoke-WebRequest `
             -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" `
             -OutFile $zip `
             -UseBasicParsing
 
+          if (!(Test-Path $zip)) {
+            throw "noVNC download failed."
+          }
+
           Expand-Archive `
             -Path $zip `
-            -DestinationPath "$env:TEMP\novnc" `
+            -DestinationPath $extract `
             -Force
 
           $source =
-            Get-ChildItem "$env:TEMP\novnc" -Directory |
+            Get-ChildItem `
+              $extract `
+              -Directory `
+              -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
           if (!$source) {
             throw "noVNC extraction failed."
           }
+
+          Remove-Item `
+            $env:NOVNC_DIR `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
 
           New-Item `
             -ItemType Directory `
@@ -446,16 +527,30 @@ jobs:
             -Recurse `
             -Force
 
-          Write-Host "Installing websockify..."
+          if (!(Test-Path "$env:NOVNC_DIR\vnc.html")) {
+            throw "vnc.html not found."
+          }
 
-          python -m pip install --upgrade pip
-
-          python -m pip install websockify
-
-          Write-Host "noVNC and websockify installed."
+          Write-Host "noVNC ready."
 
       # ============================================================
-      # 10. START NOVNC
+      # 10. INSTALL WEBSOCKIFY
+      # ============================================================
+
+      - name: Install websockify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m pip install --upgrade pip
+          python -m pip install websockify
+
+          python -m websockify --help | Out-Null
+
+          Write-Host "websockify installed."
+
+      # ============================================================
+      # 11. START NOVNC
       # ============================================================
 
       - name: Start noVNC
@@ -463,11 +558,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $novnc = "$env:NOVNC_DIR"
+          Remove-Item `
+            "$env:LOGDIR\websockify.log" `
+            -Force `
+            -ErrorAction SilentlyContinue
 
-          if (!(Test-Path "$novnc\vnc.html")) {
-            throw "noVNC vnc.html not found."
-          }
+          Remove-Item `
+            "$env:LOGDIR\websockify-error.log" `
+            -Force `
+            -ErrorAction SilentlyContinue
 
           Write-Host "Starting noVNC..."
 
@@ -476,7 +575,8 @@ jobs:
             -ArgumentList @(
               "-m"
               "websockify"
-              "--web=$novnc"
+              "--web=$env:NOVNC_DIR"
+              "--heartbeat=30"
               "6080"
               "127.0.0.1:5900"
             ) `
@@ -488,22 +588,62 @@ jobs:
             "$env:LOGDIR\websockify.pid" `
             $process.Id
 
+          Write-Host "websockify PID: $($process.Id)"
+
           Start-Sleep -Seconds 5
 
-          $check = Get-NetTCPConnection `
+      # ============================================================
+      # 12. VERIFY NOVNC
+      # ============================================================
+
+      - name: Verify noVNC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking noVNC..."
+
+          $connection = Get-NetTCPConnection `
             -LocalPort 6080 `
             -State Listen `
             -ErrorAction SilentlyContinue
 
-          if (!$check) {
-            Write-Host "websockify did not report a listening socket yet."
-          }
-          else {
-            Write-Host "noVNC is listening on TCP 6080."
+          if (!$connection) {
+
+            Write-Host ""
+            Write-Host "=============================================="
+            Write-Host " noVNC FAILED"
+            Write-Host "=============================================="
+
+            Write-Host ""
+            Write-Host "websockify stdout:"
+
+            if (Test-Path "$env:LOGDIR\websockify.log") {
+              Get-Content `
+                "$env:LOGDIR\websockify.log" `
+                -ErrorAction SilentlyContinue
+            }
+
+            Write-Host ""
+            Write-Host "websockify stderr:"
+
+            if (Test-Path "$env:LOGDIR\websockify-error.log") {
+              Get-Content `
+                "$env:LOGDIR\websockify-error.log" `
+                -ErrorAction SilentlyContinue
+            }
+
+            throw "noVNC is not listening on TCP 6080."
           }
 
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " noVNC OK"
+          Write-Host " TCP 6080 LISTENING"
+          Write-Host "=============================================="
+
       # ============================================================
-      # 11. INSTALL CLOUDFLARED
+      # 13. CLOUDFLARED
       # ============================================================
 
       - name: Install Cloudflare Tunnel
@@ -511,9 +651,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Downloading cloudflared..."
+          $cloudflared =
+            "$env:WORKSPACE\cloudflared.exe"
 
-          $cloudflared = "$env:TEMP\cloudflared.exe"
+          Write-Host "Downloading cloudflared..."
 
           Invoke-WebRequest `
             -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
@@ -524,23 +665,16 @@ jobs:
             throw "cloudflared download failed."
           }
 
-          $target = "$env:WORKSPACE\cloudflared.exe"
-
-          Copy-Item `
-            $cloudflared `
-            $target `
-            -Force
-
-          Write-Host "cloudflared installed."
+          Write-Host "cloudflared ready."
 
       # ============================================================
-      # 12. START CLOUDFLARE QUICK TUNNEL
+      # 14. START CLOUDFLARE QUICK TUNNEL
       # ============================================================
 
       - name: Start public noVNC tunnel
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
 
           $cloudflared =
             "$env:WORKSPACE\cloudflared.exe"
@@ -548,7 +682,34 @@ jobs:
           $log =
             "$env:LOGDIR\cloudflared.log"
 
-          Write-Host "Starting Cloudflare Quick Tunnel..."
+          $errorLog =
+            "$env:LOGDIR\cloudflared-error.log"
+
+          Remove-Item `
+            $log `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            $errorLog `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Get-Process `
+            cloudflared `
+            -ErrorAction SilentlyContinue |
+          Stop-Process `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 2
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " Starting Cloudflare Quick Tunnel"
+          Write-Host " Target: http://127.0.0.1:6080"
+          Write-Host "=============================================="
+          Write-Host ""
 
           $process = Start-Process `
             -FilePath $cloudflared `
@@ -556,60 +717,148 @@ jobs:
               "tunnel"
               "--url"
               "http://127.0.0.1:6080"
+              "--no-autoupdate"
             ) `
             -RedirectStandardOutput $log `
-            -RedirectStandardError "$env:LOGDIR\cloudflared-error.log" `
+            -RedirectStandardError $errorLog `
             -PassThru
 
           Set-Content `
             "$env:LOGDIR\cloudflared.pid" `
             $process.Id
 
-          # Wait for URL
+          Write-Host "Cloudflare PID: $($process.Id)"
+
           $url = $null
+
+          # --------------------------------------------------------
+          # Wait up to 120 seconds
+          # --------------------------------------------------------
 
           for ($i = 1; $i -le 60; $i++) {
 
             Start-Sleep -Seconds 2
 
+            $text = ""
+
             if (Test-Path $log) {
 
-              $text =
-                Get-Content $log -Raw -ErrorAction SilentlyContinue
+              try {
 
-              $match =
-                [regex]::Match(
-                  $text,
-                  'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-                )
+                $stdout =
+                  Get-Content `
+                    $log `
+                    -Raw `
+                    -ErrorAction SilentlyContinue
 
-              if ($match.Success) {
+                if ($null -ne $stdout) {
+                  $text += "`n$stdout"
+                }
 
-                $url = $match.Value
-                break
               }
+              catch {}
             }
+
+            if (Test-Path $errorLog) {
+
+              try {
+
+                $stderr =
+                  Get-Content `
+                    $errorLog `
+                    -Raw `
+                    -ErrorAction SilentlyContinue
+
+                if ($null -ne $stderr) {
+                  $text += "`n$stderr"
+                }
+
+              }
+              catch {}
+            }
+
+            if ([string]::IsNullOrWhiteSpace($text)) {
+
+              Write-Host "[$i/60] Waiting for Cloudflare..."
+              continue
+            }
+
+            $match = [regex]::Match(
+              $text,
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            )
+
+            if ($match.Success) {
+
+              $url =
+                $match.Value
+
+              Write-Host "Tunnel URL detected."
+
+              break
+            }
+
+            Write-Host "[$i/60] Tunnel starting..."
           }
 
-          if (!$url) {
+          # --------------------------------------------------------
+          # FAILURE
+          # --------------------------------------------------------
+
+          if ([string]::IsNullOrWhiteSpace($url)) {
 
             Write-Host ""
-            Write-Host "Cloudflare output:"
-            Get-Content $log -ErrorAction SilentlyContinue
+            Write-Host "=============================================="
+            Write-Host " CLOUDFLARE TUNNEL FAILED"
+            Write-Host "=============================================="
+
+            Write-Host ""
+            Write-Host "Cloudflare STDOUT:"
+
+            if (Test-Path $log) {
+              Get-Content `
+                $log `
+                -ErrorAction SilentlyContinue
+            }
+            else {
+              Write-Host "(empty)"
+            }
+
+            Write-Host ""
+            Write-Host "Cloudflare STDERR:"
+
+            if (Test-Path $errorLog) {
+              Get-Content `
+                $errorLog `
+                -ErrorAction SilentlyContinue
+            }
+            else {
+              Write-Host "(empty)"
+            }
+
+            if ($process.HasExited) {
+              Write-Host ""
+              Write-Host "Process exited."
+              Write-Host "Exit code: $($process.ExitCode)"
+            }
 
             throw "Cloudflare Quick Tunnel URL was not detected."
           }
+
+          # --------------------------------------------------------
+          # SUCCESS
+          # --------------------------------------------------------
 
           $novncURL =
             "$url/vnc.html?autoconnect=true&resize=remote"
 
           Set-Content `
-            "$env:LOGDIR\novnc-url.txt" `
-            $novncURL
-
-          Set-Content `
             "$env:LOGDIR\tunnel-url.txt" `
             $url
+
+          Set-Content `
+            "$env:LOGDIR\novnc-url.txt" `
+            $novncURL
 
           Write-Host ""
           Write-Host ""
@@ -624,6 +873,7 @@ jobs:
           Write-Host "TCP 6080"
           Write-Host ""
           Write-Host "WEB URL:"
+          Write-Host ""
           Write-Host $novncURL
           Write-Host ""
           Write-Host "Password:"
@@ -632,10 +882,10 @@ jobs:
           Write-Host "=============================================="
 
       # ============================================================
-      # 13. FINAL CONNECTION INFORMATION
+      # 15. FINAL INFORMATION
       # ============================================================
 
-      - name: Show final connection information
+      - name: Show connection information
         shell: pwsh
         run: |
           $anydesk = "Unavailable"
@@ -643,12 +893,16 @@ jobs:
 
           if (Test-Path "$env:LOGDIR\anydesk-id.txt") {
             $anydesk =
-              Get-Content "$env:LOGDIR\anydesk-id.txt"
+              Get-Content `
+                "$env:LOGDIR\anydesk-id.txt" `
+                -Raw
           }
 
           if (Test-Path "$env:LOGDIR\novnc-url.txt") {
             $web =
-              Get-Content "$env:LOGDIR\novnc-url.txt"
+              Get-Content `
+                "$env:LOGDIR\novnc-url.txt" `
+                -Raw
           }
 
           $info = @"
@@ -669,13 +923,12 @@ jobs:
           Workspace:
           $env:WORKSPACE
 
-          ----------------------------------------------
+          ==============================================
 
-          ANYDESK
-          ID:
+          ANYDESK ID:
           $anydesk
 
-          ----------------------------------------------
+          ==============================================
 
           DAO WEB VNC
 
@@ -691,7 +944,7 @@ jobs:
           Password:
           Use VNC_PASSWORD Secret
 
-          ----------------------------------------------
+          ==============================================
 
           Runtime:
           4 hours maximum
@@ -712,17 +965,15 @@ jobs:
           Write-Host $info
 
       # ============================================================
-      # 14. KEEP DESKTOP ALIVE
+      # 16. KEEP ALIVE
       # ============================================================
 
       - name: Keep desktop alive
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "=============================================="
-          Write-Host " DAO WINDOWS DESKTOP IS RUNNING"
-          Write-Host " Maximum runtime: 4 HOURS"
-          Write-Host "=============================================="
+          Write-Host "DAO WINDOWS DESKTOP IS RUNNING"
+          Write-Host "Maximum runtime: 4 hours"
           Write-Host ""
 
           for ($minute = 1; $minute -le 235; $minute++) {
@@ -739,7 +990,7 @@ jobs:
           Write-Host "Runtime limit reached."
 
       # ============================================================
-      # 15. BACKUP
+      # 17. BACKUP
       # ============================================================
 
       - name: Prepare backup
@@ -756,10 +1007,7 @@ jobs:
             -Path $env:BACKUP |
             Out-Null
 
-          # --------------------------------------------------------
           # Workspace
-          # --------------------------------------------------------
-
           $workspaceBackup =
             "$env:BACKUP\workspace"
 
@@ -788,6 +1036,7 @@ jobs:
                   -Recurse `
                   -Force `
                   -ErrorAction Stop
+
               }
               catch {
 
@@ -797,10 +1046,7 @@ jobs:
             }
           }
 
-          # --------------------------------------------------------
           # FileZilla
-          # --------------------------------------------------------
-
           $fz =
             "$env:APPDATA\FileZilla"
 
@@ -826,6 +1072,7 @@ jobs:
                   -Recurse `
                   -Force `
                   -ErrorAction Stop
+
               }
               catch {
 
@@ -835,10 +1082,7 @@ jobs:
             }
           }
 
-          # --------------------------------------------------------
           # Geany
-          # --------------------------------------------------------
-
           $geany =
             "$env:APPDATA\geany"
 
@@ -864,6 +1108,7 @@ jobs:
                   -Recurse `
                   -Force `
                   -ErrorAction Stop
+
               }
               catch {
 
@@ -873,10 +1118,7 @@ jobs:
             }
           }
 
-          # --------------------------------------------------------
-          # Documents - only accessible files
-          # --------------------------------------------------------
-
+          # Documents
           $documents =
             [Environment]::GetFolderPath("MyDocuments")
 
@@ -905,6 +1147,7 @@ jobs:
                   -Destination $docBackup `
                   -Force `
                   -ErrorAction Stop
+
               }
               catch {
 
@@ -914,20 +1157,14 @@ jobs:
             }
           }
 
-          # --------------------------------------------------------
           # Logs
-          # --------------------------------------------------------
-
-          $logsBackup =
-            "$env:BACKUP\Logs"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $logsBackup |
-            Out-Null
-
           if (Test-Path $env:LOGDIR) {
+
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path "$env:BACKUP\Logs" |
+              Out-Null
 
             Get-ChildItem `
               $env:LOGDIR `
@@ -935,7 +1172,7 @@ jobs:
               -Force `
               -ErrorAction SilentlyContinue |
             Copy-Item `
-              -Destination $logsBackup `
+              -Destination "$env:BACKUP\Logs" `
               -Force `
               -ErrorAction SilentlyContinue
           }
@@ -943,7 +1180,7 @@ jobs:
           Write-Host "Backup completed."
 
       # ============================================================
-      # 16. UPLOAD BACKUP
+      # 18. UPLOAD BACKUP
       # ============================================================
 
       - name: Upload backup
@@ -956,7 +1193,7 @@ jobs:
           if-no-files-found: warn
 
       # ============================================================
-      # 17. UPLOAD LOGS
+      # 19. UPLOAD LOGS
       # ============================================================
 
       - name: Upload logs
@@ -969,7 +1206,7 @@ jobs:
           if-no-files-found: warn
 
       # ============================================================
-      # 18. CLEANUP
+      # 20. CLEANUP
       # ============================================================
 
       - name: Cleanup
@@ -980,28 +1217,33 @@ jobs:
 
           Write-Host "Cleaning up..."
 
+          Get-Process filezilla `
+            -ErrorAction SilentlyContinue |
           Stop-Process `
-            -Name "filezilla" `
             -Force `
             -ErrorAction SilentlyContinue
 
+          Get-Process geany `
+            -ErrorAction SilentlyContinue |
           Stop-Process `
-            -Name "geany" `
             -Force `
             -ErrorAction SilentlyContinue
 
+          Get-Process AnyDesk `
+            -ErrorAction SilentlyContinue |
           Stop-Process `
-            -Name "AnyDesk" `
             -Force `
             -ErrorAction SilentlyContinue
 
+          Get-Process cloudflared `
+            -ErrorAction SilentlyContinue |
           Stop-Process `
-            -Name "cloudflared" `
             -Force `
             -ErrorAction SilentlyContinue
 
+          Get-Process python `
+            -ErrorAction SilentlyContinue |
           Stop-Process `
-            -Name "python" `
             -Force `
             -ErrorAction SilentlyContinue
 
