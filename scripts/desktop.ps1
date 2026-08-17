@@ -1,134 +1,167 @@
 [CmdletBinding()]
 param(
-    [switch]$RuntimeOnly
+    [int]$RuntimeMinutes = 225
 )
 
 Set-StrictMode -Version Latest
+
 $ErrorActionPreference = "Continue"
+
+# ============================================================
+# PATHS
+# ============================================================
 
 $Workspace = "D:\DAO-Workspace"
 $Logs      = "D:\DAO-Logs"
-$Tools     = "D:\DAO-Tools"
 
 $VncPort   = 5900
-$NoVncPort = 6080
+$WebPort   = 6080
 
-$NoVncVersion     = "1.7.0"
-$WebsockifyVersion = "0.13.0"
+$NoVncDir  = "D:\DAO-Workspace\Applications\noVNC"
+$ToolsDir  = "D:\DAO-Workspace\Applications"
 
-$NoVncRoot = Join-Path $Tools "noVNC"
+$TunnelUrlFile = Join-Path $Logs "tunnel-url.txt"
+$NoVncUrlFile  = Join-Path $Logs "novnc-url.txt"
+$AnyDeskIdFile = Join-Path $Logs "anydesk-id.txt"
 
-$DesktopLog = Join-Path $Logs "desktop.log"
+$VncLog       = Join-Path $Logs "vnc.log"
+$WebLog       = Join-Path $Logs "websockify.log"
+$WebErrorLog  = Join-Path $Logs "websockify-error.log"
+$CloudLog     = Join-Path $Logs "cloudflared.log"
+$CloudErrLog  = Join-Path $Logs "cloudflared-error.log"
+$AnyDeskLog   = Join-Path $Logs "anydesk.log"
+$Connection   = Join-Path $Logs "connection-info.txt"
 
-New-Item -ItemType Directory -Path $Workspace -Force | Out-Null
-New-Item -ItemType Directory -Path $Logs -Force | Out-Null
-New-Item -ItemType Directory -Path $Tools -Force | Out-Null
+New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
+New-Item -ItemType Directory -Force -Path $Logs | Out-Null
+New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
 
+# ============================================================
+# HELPERS
+# ============================================================
 
-# ==============================================================
-# LOGGING
-# ==============================================================
-
-function Write-DaoLog {
+function Write-Log {
     param(
-        [Parameter(Mandatory)]
         [string]$Message,
-
-        [ValidateSet("INFO","WARN","ERROR")]
-        [string]$Level = "INFO"
+        [string]$File = ""
     )
 
-    $line = "[{0}] [{1}] {2}" -f `
-        (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `
-        $Level, `
-        $Message
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] $Message"
 
-    Add-Content `
-        -LiteralPath $DesktopLog `
-        -Value $line `
-        -Encoding UTF8
+    Write-Host $line
 
-    switch ($Level) {
-        "ERROR" {
-            Write-Host "[ERROR] $Message"
+    if ($File) {
+        try {
+            Add-Content -LiteralPath $File -Value $line -ErrorAction SilentlyContinue
         }
-
-        "WARN" {
-            Write-Host "[WARN]  $Message"
-        }
-
-        default {
-            Write-Host "[INFO]  $Message"
+        catch {
         }
     }
 }
 
-
-# ==============================================================
-# SAFE FILE READ
-# ==============================================================
-
-function Read-SafeText {
+function Test-TcpPort {
     param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return ""
-    }
-
-    try {
-        $content = Get-Content `
-            -LiteralPath $Path `
-            -Raw `
-            -ErrorAction SilentlyContinue
-
-        if ($null -eq $content) {
-            return ""
-        }
-
-        return [string]$content
-    }
-    catch {
-        return ""
-    }
-}
-
-
-# ==============================================================
-# PORT CHECK
-# ==============================================================
-
-function Test-PortListening {
-    param(
-        [Parameter(Mandatory)]
+        [string]$HostName = "127.0.0.1",
         [int]$Port,
-
-        [string]$Address = "127.0.0.1"
+        [int]$TimeoutMs = 1000
     )
 
     try {
-        $result = Test-NetConnection `
-            -ComputerName $Address `
-            -Port $Port `
-            -InformationLevel Quiet `
-            -WarningAction SilentlyContinue `
-            -ErrorAction SilentlyContinue
+        $client = [System.Net.Sockets.TcpClient]::new()
 
-        return [bool]$result
+        $async = $client.BeginConnect(
+            $HostName,
+            $Port,
+            $null,
+            $null
+        )
+
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $client.Close()
+            return $false
+        }
+
+        $client.EndConnect($async)
+        $client.Close()
+
+        return $true
     }
     catch {
         return $false
     }
 }
 
-
-function Wait-Port {
+function Get-PortOwner {
     param(
-        [Parameter(Mandatory)]
-        [int]$Port,
+        [int]$Port
+    )
 
+    try {
+        $connections = Get-NetTCPConnection `
+            -LocalPort $Port `
+            -ErrorAction SilentlyContinue
+
+        foreach ($connection in $connections) {
+
+            $pid = $connection.OwningProcess
+
+            if ($pid -and $pid -ne 0) {
+
+                try {
+                    $process = Get-Process `
+                        -Id $pid `
+                        -ErrorAction SilentlyContinue
+
+                    if ($process) {
+                        return "$($process.ProcessName) PID=$pid"
+                    }
+                }
+                catch {
+                }
+            }
+        }
+    }
+    catch {
+    }
+
+    return "unknown"
+}
+
+function Stop-ProcessesByName {
+    param(
+        [string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+
+        try {
+            $processes = Get-Process `
+                -Name $name `
+                -ErrorAction SilentlyContinue
+
+            foreach ($process in $processes) {
+
+                Write-Log "Stopping stale process $name PID=$($process.Id)"
+
+                try {
+                    Stop-Process `
+                        -Id $process.Id `
+                        -Force `
+                        -ErrorAction SilentlyContinue
+                }
+                catch {
+                }
+            }
+        }
+        catch {
+        }
+    }
+}
+
+function Wait-ForPort {
+    param(
+        [int]$Port,
         [int]$TimeoutSeconds = 30
     )
 
@@ -136,7 +169,7 @@ function Wait-Port {
 
     while ((Get-Date) -lt $deadline) {
 
-        if (Test-PortListening -Port $Port) {
+        if (Test-TcpPort -Port $Port) {
             return $true
         }
 
@@ -146,638 +179,597 @@ function Wait-Port {
     return $false
 }
 
-
-# ==============================================================
-# PORT OWNER
-# ==============================================================
-
-function Get-PortOwner {
-    param(
-        [Parameter(Mandatory)]
-        [int]$Port
-    )
-
-    try {
-        $connection = Get-NetTCPConnection `
-            -LocalPort $Port `
-            -State Listen `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-        if ($null -eq $connection) {
-            return $null
-        }
-
-        return Get-Process `
-            -Id $connection.OwningProcess `
-            -ErrorAction SilentlyContinue
-    }
-    catch {
-        return $null
-    }
-}
-
-
-# ==============================================================
-# PROCESS CLEANUP
-# ==============================================================
-
-function Stop-ProcessSafe {
-    param(
-        [string]$Name
-    )
-
-    try {
-        $processes = Get-Process `
-            -Name $Name `
-            -ErrorAction SilentlyContinue
-
-        foreach ($process in $processes) {
-            Write-DaoLog `
-                "Stopping stale $Name process PID $($process.Id)." `
-                "WARN"
-
-            try {
-                Stop-Process `
-                    -Id $process.Id `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-            }
-            catch {
-            }
-        }
-    }
-    catch {
-    }
-}
-
-
-function Clear-PortIfSafe {
-    param(
-        [int]$Port,
-
-        [string[]]$AllowedProcessNames
-    )
-
-    $owner = Get-PortOwner -Port $Port
-
-    if ($null -eq $owner) {
-        return $true
-    }
-
-    Write-DaoLog `
-        "Port $Port is occupied by PID $($owner.Id) ($($owner.ProcessName))." `
-        "WARN"
-
-    $name = $owner.ProcessName.ToLowerInvariant()
-
-    $allowed = $AllowedProcessNames |
-        ForEach-Object { $_.ToLowerInvariant() }
-
-    if ($allowed -contains $name) {
-        Write-DaoLog `
-            "Existing process appears to be an expected service." `
-            "INFO"
-
-        return $true
-    }
-
-    Write-DaoLog `
-        "Port owner is not an expected DAO process. It will not be killed automatically." `
-        "WARN"
-
-    return $false
-}
-
-
-# ==============================================================
-# EXECUTABLE DETECTION
-# ==============================================================
-
 function Find-Executable {
     param(
-        [Parameter(Mandatory)]
-        [string[]]$Names
+        [string[]]$Names,
+        [string[]]$Paths = @()
     )
 
     foreach ($name in $Names) {
 
         try {
-            $command = Get-Command `
-                $name `
-                -ErrorAction SilentlyContinue
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue
 
-            if ($null -ne $command) {
-
-                if (-not [string]::IsNullOrWhiteSpace($command.Source)) {
-                    return $command.Source
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($command.Path)) {
-                    return $command.Path
-                }
+            if ($cmd) {
+                return $cmd.Source
             }
         }
         catch {
         }
     }
 
-    $roots = @(
-        "C:\Program Files",
-        "C:\Program Files (x86)",
-        "C:\ProgramData\chocolatey\bin",
-        "C:\tools"
-    )
+    foreach ($path in $Paths) {
 
-    foreach ($root in $roots) {
-
-        if (-not (Test-Path -LiteralPath $root)) {
-            continue
-        }
-
-        foreach ($name in $Names) {
-
-            try {
-                $found = Get-ChildItem `
-                    -LiteralPath $root `
-                    -Filter $name `
-                    -File `
-                    -Recurse `
-                    -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-
-                if ($null -ne $found) {
-                    return $found.FullName
-                }
-            }
-            catch {
-            }
+        if (Test-Path $path) {
+            return $path
         }
     }
 
     return $null
 }
 
-
-# ==============================================================
-# CHOCOLATEY
-# ==============================================================
-
-function Install-ChocoPackage {
+function Install-WingetPackage {
     param(
-        [Parameter(Mandatory)]
-        [string]$Package,
-
-        [Parameter(Mandatory)]
-        [scriptblock]$Detector
+        [string]$Id,
+        [string]$DisplayName,
+        [switch]$Optional
     )
 
-    try {
-        $existing = & $Detector
+    Write-Log "Checking $DisplayName..."
 
-        if (-not [string]::IsNullOrWhiteSpace([string]$existing)) {
-            Write-DaoLog "$Package already installed: $existing"
-            return $true
-        }
-    }
-    catch {
-    }
-
-    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-        Write-DaoLog `
-            "Chocolatey is not available; cannot install $Package." `
-            "ERROR"
-
-        return $false
-    }
-
-    Write-DaoLog "Installing $Package."
-
-    try {
-        & choco install $Package `
-            -y `
-            --no-progress `
-            --limit-output
-
-        $code = $LASTEXITCODE
-
-        if ($code -ne 0) {
-            Write-DaoLog `
-                "$Package installation returned exit code $code." `
-                "ERROR"
-
-            return $false
-        }
-
-        Start-Sleep -Seconds 2
-
-        $existing = & $Detector
-
-        if (-not [string]::IsNullOrWhiteSpace([string]$existing)) {
-            Write-DaoLog "$Package installation verified."
-            return $true
-        }
-
-        Write-DaoLog `
-            "$Package installed but could not be detected afterward." `
-            "ERROR"
-
-        return $false
-    }
-    catch {
-        Write-DaoLog `
-            "Exception installing $Package: $($_.Exception.Message)" `
-            "ERROR"
-
-        return $false
-    }
-}
-
-
-# ==============================================================
-# NO-VNC
-# ==============================================================
-
-function Install-NoVnc {
-
-    $vncHtml = Join-Path $NoVncRoot "vnc.html"
-
-    if (Test-Path -LiteralPath $vncHtml) {
-        Write-DaoLog "noVNC is already installed."
-        return $true
-    }
-
-    $zip = Join-Path `
-        $Tools `
-        "noVNC-$NoVncVersion.zip"
-
-    $extract = Join-Path `
-        $Tools `
-        "noVNC-extract"
+    $installed = $false
 
     try {
 
-        Write-DaoLog `
-            "Downloading noVNC $NoVncVersion."
-
-        Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v$NoVncVersion.zip" `
-            -OutFile $zip `
-            -UseBasicParsing `
-            -ErrorAction Stop
-
-        if (Test-Path -LiteralPath $extract) {
-            Remove-Item `
-                -LiteralPath $extract `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
-        }
-
-        New-Item `
-            -ItemType Directory `
-            -Path $extract `
-            -Force | Out-Null
-
-        Expand-Archive `
-            -LiteralPath $zip `
-            -DestinationPath $extract `
-            -Force `
-            -ErrorAction Stop
-
-        $source = Get-ChildItem `
-            -LiteralPath $extract `
-            -Directory `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-        if ($null -eq $source) {
-            throw "Could not locate extracted noVNC directory."
-        }
-
-        if (Test-Path -LiteralPath $NoVncRoot) {
-            Remove-Item `
-                -LiteralPath $NoVncRoot `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
-        }
-
-        Move-Item `
-            -LiteralPath $source.FullName `
-            -Destination $NoVncRoot `
-            -Force
-
-        Remove-Item `
-            -LiteralPath $zip `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-        Remove-Item `
-            -LiteralPath $extract `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-        if (-not (Test-Path -LiteralPath $vncHtml)) {
-            throw "vnc.html was not found."
-        }
-
-        Write-DaoLog "noVNC installation verified."
-
-        return $true
-    }
-    catch {
-
-        Write-DaoLog `
-            "noVNC installation failed: $($_.Exception.Message)" `
-            "ERROR"
-
-        return $false
-    }
-}
-
-
-# ==============================================================
-# WEBSOCKIFY
-# ==============================================================
-
-function Install-Websockify {
-
-    try {
-
-        $python = Get-Command `
-            python `
-            -ErrorAction SilentlyContinue
-
-        if ($null -eq $python) {
-            Write-DaoLog `
-                "Python is unavailable." `
-                "ERROR"
-
-            return $false
-        }
-
-        $script:PythonExe = $python.Source
-
-        $installed = & $script:PythonExe `
-            -m pip show websockify `
+        $list = & winget list `
+            --id $Id `
+            --exact `
+            --accept-source-agreements `
             2>$null
 
-        if ($installed) {
-
-            $versionLine = $installed |
-                Where-Object { $_ -match "^Version:" } |
-                Select-Object -First 1
-
-            if ($versionLine -match [regex]::Escape($WebsockifyVersion)) {
-                Write-DaoLog `
-                    "websockify $WebsockifyVersion is already installed."
-
-                return $true
-            }
+        if ($LASTEXITCODE -eq 0 -and $list) {
+            $installed = $true
         }
+    }
+    catch {
+    }
 
-        Write-DaoLog `
-            "Installing websockify $WebsockifyVersion."
-
-        & $script:PythonExe `
-            -m pip install `
-            --disable-pip-version-check `
-            --no-input `
-            "websockify==$WebsockifyVersion"
-
-        if ($LASTEXITCODE -ne 0) {
-
-            Write-DaoLog `
-                "websockify installation failed." `
-                "ERROR"
-
-            return $false
-        }
-
-        & $script:PythonExe `
-            -m websockify `
-            --help `
-            > $null `
-            2>&1
-
-        if ($LASTEXITCODE -ne 0) {
-
-            Write-DaoLog `
-                "websockify verification failed." `
-                "ERROR"
-
-            return $false
-        }
-
-        Write-DaoLog "websockify verified."
-
+    if ($installed) {
+        Write-Log "[OK] $DisplayName already installed."
         return $true
+    }
+
+    Write-Log "Installing $DisplayName..."
+
+    try {
+
+        & winget install `
+            --id $Id `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements `
+            --disable-interactivity
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "[OK] $DisplayName installed."
+            return $true
+        }
+
+        Write-Log "[WARN] winget returned exit code $LASTEXITCODE for $DisplayName."
+
+        if ($Optional) {
+            return $false
+        }
+
+        return $false
     }
     catch {
 
-        Write-DaoLog `
-            "websockify exception: $($_.Exception.Message)" `
-            "ERROR"
+        Write-Log "[WARN] Could not install $DisplayName : $($_.Exception.Message)"
+
+        if ($Optional) {
+            return $false
+        }
 
         return $false
     }
 }
 
+# ============================================================
+# CHECK WINDOWS
+# ============================================================
 
-# ==============================================================
-# LOGGED PROCESS
-# ==============================================================
+Write-Log "=============================================="
+Write-Log "DAO WINDOWS DESKTOP STARTING"
+Write-Log "=============================================="
 
-function Start-LoggedProcess {
-    param(
-        [Parameter(Mandatory)]
-        [string]$FilePath,
+$os = Get-CimInstance Win32_OperatingSystem
 
-        [Parameter(Mandatory)]
-        [string[]]$Arguments,
+Write-Log "Windows: $($os.Caption)"
+Write-Log "Version: $($os.Version)"
+Write-Log "Computer: $env:COMPUTERNAME"
 
-        [Parameter(Mandatory)]
-        [string]$StdOut,
+# ============================================================
+# SECRET VALIDATION
+# ============================================================
 
-        [Parameter(Mandatory)]
-        [string]$StdErr,
+$VncPassword = [Environment]::GetEnvironmentVariable("VNC_PASSWORD")
+$AnyDeskPassword = [Environment]::GetEnvironmentVariable("ANYDESK_PASSWORD")
 
-        [string]$WorkingDirectory
+if ([string]::IsNullOrWhiteSpace($VncPassword)) {
+    Write-Log "[WARN] VNC_PASSWORD secret is missing. TightVNC cannot be configured."
+}
+
+if ([string]::IsNullOrWhiteSpace($AnyDeskPassword)) {
+    Write-Log "[WARN] ANYDESK_PASSWORD secret is missing. AnyDesk unattended access will be unavailable."
+}
+
+# ============================================================
+# CLEAN STALE PROCESSES
+# ============================================================
+
+Write-Log "Cleaning stale processes..."
+
+Stop-ProcessesByName @(
+    "websockify",
+    "python",
+    "cloudflared"
+)
+
+# AnyDesk is handled carefully and not blindly killed.
+
+# ============================================================
+# WINGET
+# ============================================================
+
+$winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+if (-not $winget) {
+
+    Write-Log "[WARN] winget.exe is not available on this runner."
+
+}
+else {
+
+    Write-Log "winget: $($winget.Source)"
+
+    # --------------------------------------------------------
+    # FileZilla
+    # --------------------------------------------------------
+
+    $filezillaOk = Install-WingetPackage `
+        -Id "FileZilla.FileZilla" `
+        -DisplayName "FileZilla" `
+        -Optional
+
+    # --------------------------------------------------------
+    # Geany
+    # --------------------------------------------------------
+
+    $geanyOk = Install-WingetPackage `
+        -Id "Geany.Geany" `
+        -DisplayName "Geany" `
+        -Optional
+
+    # --------------------------------------------------------
+    # TightVNC
+    # --------------------------------------------------------
+
+    $tightOk = Install-WingetPackage `
+        -Id "GlavSoft.TightVNC" `
+        -DisplayName "TightVNC"
+
+    # --------------------------------------------------------
+    # AnyDesk
+    # --------------------------------------------------------
+
+    $anydeskOk = Install-WingetPackage `
+        -Id "AnyDeskSoftwareGmbH.AnyDesk" `
+        -DisplayName "AnyDesk" `
+        -Optional
+
+    # --------------------------------------------------------
+    # cloudflared
+    # --------------------------------------------------------
+
+    $cloudOk = Install-WingetPackage `
+        -Id "Cloudflare.cloudflared" `
+        -DisplayName "Cloudflare cloudflared"
+
+}
+
+# ============================================================
+# FIND APPLICATIONS
+# ============================================================
+
+$filezilla = Find-Executable `
+    -Names @("filezilla.exe") `
+    -Paths @(
+        "$env:ProgramFiles\FileZilla FTP Client\filezilla.exe",
+        "${env:ProgramFiles(x86)}\FileZilla FTP Client\filezilla.exe"
     )
 
-    $parentOut = Split-Path -Parent $StdOut
-    $parentErr = Split-Path -Parent $StdErr
+$geany = Find-Executable `
+    -Names @("geany.exe") `
+    -Paths @(
+        "$env:ProgramFiles\Geany\bin\geany.exe",
+        "$env:ProgramFiles\Geany\geany.exe",
+        "${env:ProgramFiles(x86)}\Geany\bin\geany.exe",
+        "${env:ProgramFiles(x86)}\Geany\geany.exe"
+    )
 
-    New-Item `
-        -ItemType Directory `
-        -Path $parentOut `
-        -Force | Out-Null
+$tightVnc = Find-Executable `
+    -Names @("tvnserver.exe", "winvnc.exe") `
+    -Paths @(
+        "$env:ProgramFiles\TightVNC\tvnserver.exe",
+        "$env:ProgramFiles\TightVNC\winvnc.exe",
+        "${env:ProgramFiles(x86)}\TightVNC\tvnserver.exe",
+        "${env:ProgramFiles(x86)}\TightVNC\winvnc.exe"
+    )
 
-    New-Item `
-        -ItemType Directory `
-        -Path $parentErr `
-        -Force | Out-Null
+$cloudflared = Find-Executable `
+    -Names @("cloudflared.exe") `
+    -Paths @(
+        "$env:ProgramFiles\cloudflared\cloudflared.exe",
+        "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Cloudflare.cloudflared*\cloudflared.exe"
+    )
 
-    Remove-Item `
-        -LiteralPath $StdOut `
-        -Force `
-        -ErrorAction SilentlyContinue
+$anydesk = Find-Executable `
+    -Names @("AnyDesk.exe", "anydesk.exe") `
+    -Paths @(
+        "$env:ProgramFiles\AnyDesk\AnyDesk.exe",
+        "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe",
+        "$env:ProgramFiles\AnyDesk\AnyDesk.exe"
+    )
 
-    Remove-Item `
-        -LiteralPath $StdErr `
-        -Force `
-        -ErrorAction SilentlyContinue
+Write-Log "FileZilla: $filezilla"
+Write-Log "Geany: $geany"
+Write-Log "TightVNC: $tightVnc"
+Write-Log "cloudflared: $cloudflared"
+Write-Log "AnyDesk: $anydesk"
 
-    $params = @{
-        FilePath               = $FilePath
-        ArgumentList           = $Arguments
-        RedirectStandardOutput = $StdOut
-        RedirectStandardError  = $StdErr
-        WindowStyle            = "Hidden"
-        PassThru                = $true
+# ============================================================
+# noVNC
+# ============================================================
+
+Write-Log "Preparing noVNC..."
+
+New-Item -ItemType Directory -Force -Path $NoVncDir | Out-Null
+
+$NoVncGit = Get-Command git.exe -ErrorAction SilentlyContinue
+
+if ($NoVncGit) {
+
+    if (-not (Test-Path (Join-Path $NoVncDir "vnc.html"))) {
+
+        Write-Log "Downloading noVNC from official GitHub repository..."
+
+        try {
+
+            & git clone `
+                --depth 1 `
+                --branch v1.7.0 `
+                "https://github.com/novnc/noVNC.git" `
+                $NoVncDir
+
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "[WARN] noVNC git clone returned $LASTEXITCODE."
+            }
+        }
+        catch {
+            Write-Log "[WARN] noVNC download failed: $($_.Exception.Message)"
+        }
     }
-
-    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
-        $params.WorkingDirectory = $WorkingDirectory
-    }
-
-    return Start-Process @params
 }
+else {
 
-
-# ==============================================================
-# TIGHTVNC
-# ==============================================================
-
-function Get-TightVncService {
+    Write-Log "[WARN] git.exe unavailable. Trying archive download..."
 
     try {
-        return Get-Service `
-            -Name "tvnserver" `
-            -ErrorAction SilentlyContinue
+
+        $zip = "$ToolsDir\novnc.zip"
+
+        Invoke-WebRequest `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.zip" `
+            -OutFile $zip `
+            -UseBasicParsing
+
+        if (Test-Path $zip) {
+
+            Expand-Archive `
+                -LiteralPath $zip `
+                -DestinationPath $ToolsDir `
+                -Force
+
+            $extracted = Join-Path $ToolsDir "noVNC-1.7.0"
+
+            if (Test-Path $extracted) {
+
+                if (Test-Path $NoVncDir) {
+                    Remove-Item $NoVncDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+
+                Move-Item `
+                    -LiteralPath $extracted `
+                    -Destination $NoVncDir
+            }
+        }
     }
     catch {
-        return $null
+        Write-Log "[ERROR] noVNC download failed: $($_.Exception.Message)"
     }
 }
 
+if (-not (Test-Path (Join-Path $NoVncDir "vnc.html"))) {
+    throw "noVNC vnc.html was not found."
+}
 
-function Start-TightVnc {
+Write-Log "[OK] noVNC files available."
 
-    if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+# ============================================================
+# PYTHON / WEBSOCKIFY
+# ============================================================
 
-        Write-DaoLog `
-            "VNC_PASSWORD secret is missing." `
-            "ERROR"
+$python = Find-Executable `
+    -Names @("python.exe", "py.exe")
 
-        return $false
+if (-not $python) {
+    throw "Python is required for websockify but was not found."
+}
+
+Write-Log "Python: $python"
+
+Write-Log "Installing/updating websockify..."
+
+try {
+
+    & $python -m pip install `
+        --disable-pip-version-check `
+        --no-input `
+        --upgrade `
+        websockify
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip failed with exit code $LASTEXITCODE"
     }
+}
+catch {
+    throw "websockify installation failed: $($_.Exception.Message)"
+}
 
-    $service = Get-TightVncService
+$websockify = Find-Executable `
+    -Names @("websockify.exe", "websockify")
 
-    if ($null -eq $service) {
+if (-not $websockify) {
 
-        Write-DaoLog `
-            "TightVNC service was not found." `
-            "ERROR"
+    $scriptsPath = Join-Path `
+        ([Environment]::GetFolderPath("LocalApplicationData")) `
+        "Programs\Python"
 
-        return $false
+    $possible = Get-ChildItem `
+        -Path $scriptsPath `
+        -Filter "websockify.exe" `
+        -Recurse `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if ($possible) {
+        $websockify = $possible.FullName
     }
+}
 
-    try {
+if (-not $websockify) {
+    throw "websockify executable could not be located."
+}
 
-        Stop-Service `
-            -Name "tvnserver" `
-            -Force `
-            -ErrorAction SilentlyContinue
+Write-Log "websockify: $websockify"
 
-        Start-Sleep -Seconds 2
+# ============================================================
+# TIGHTVNC
+# ============================================================
 
-        Start-Service `
-            -Name "tvnserver" `
-            -ErrorAction SilentlyContinue
+if (-not $tightVnc) {
 
-        Start-Sleep -Seconds 3
+    Write-Log "[ERROR] TightVNC executable not found."
+}
+else {
 
-        if (-not (Wait-Port -Port $VncPort -TimeoutSeconds 30)) {
+    # --------------------------------------------------------
+    # Configure VNC registry.
+    #
+    # TightVNC 2.8 uses:
+    # HKLM\SOFTWARE\TightVNC\Server
+    #
+    # Password is written only as encrypted VNC registry bytes.
+    # The actual secret is never written to logs.
+    # --------------------------------------------------------
 
-            Write-DaoLog `
-                "TightVNC is not listening on TCP $VncPort." `
-                "ERROR"
+    if (-not [string]::IsNullOrWhiteSpace($VncPassword)) {
 
-            $owner = Get-PortOwner -Port $VncPort
+        Write-Log "Configuring TightVNC authentication..."
 
-            if ($null -ne $owner) {
-                Write-DaoLog `
-                    "TCP $VncPort owner: PID $($owner.Id), $($owner.ProcessName)." `
-                    "ERROR"
+        try {
+
+            $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
+
+            New-Item `
+                -Path $regPath `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+
+            # TightVNC uses an 8-byte VNC password.
+            $password8 = $VncPassword
+
+            if ($password8.Length -gt 8) {
+                $password8 = $password8.Substring(0, 8)
+                Write-Log "TightVNC password was longer than 8 characters; TightVNC uses its first 8 characters."
             }
 
-            return $false
+            while ($password8.Length -lt 8) {
+                $password8 += [char]0
+            }
+
+            # Standard VNC password DES key.
+            $key = [byte[]](
+                0x17, 0x52, 0x6B, 0x5B,
+                0x9C, 0x64, 0x31, 0x87
+            )
+
+            $plain = [System.Text.Encoding]::ASCII.GetBytes($password8)
+
+            $des = [System.Security.Cryptography.DES]::Create()
+
+            try {
+
+                $des.Mode = [System.Security.Cryptography.CipherMode]::ECB
+                $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+                $des.Key = $key
+
+                $encrypted = $des.CreateEncryptor().TransformFinalBlock(
+                    $plain,
+                    0,
+                    8
+                )
+            }
+            finally {
+                $des.Dispose()
+            }
+
+            New-ItemProperty `
+                -Path $regPath `
+                -Name "Password" `
+                -PropertyType Binary `
+                -Value $encrypted `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+
+            New-ItemProperty `
+                -Path $regPath `
+                -Name "UseVncAuthentication" `
+                -PropertyType DWord `
+                -Value 1 `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+
+            New-ItemProperty `
+                -Path $regPath `
+                -Name "RfbPort" `
+                -PropertyType DWord `
+                -Value 5900 `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+
+            New-ItemProperty `
+                -Path $regPath `
+                -Name "LoopbackOnly" `
+                -PropertyType DWord `
+                -Value 0 `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+
+            Write-Log "[OK] TightVNC registry configuration completed."
+
         }
+        catch {
 
-        Write-DaoLog `
-            "TightVNC is listening on TCP $VncPort."
-
-        return $true
+            Write-Log "[WARN] TightVNC registry configuration failed: $($_.Exception.Message)"
+        }
     }
-    catch {
 
-        Write-DaoLog `
-            "TightVNC startup exception: $($_.Exception.Message)" `
-            "ERROR"
-
-        return $false
-    }
-}
-
-
-# ==============================================================
-# ANYDESK
-# ==============================================================
-
-function Configure-AnyDesk {
-
-    $idFile = Join-Path $Logs "anydesk-id.txt"
-    $anydeskLog = Join-Path $Logs "anydesk.log"
-
-    $exe = Find-Executable `
-        -Names @("AnyDesk.exe")
-
-    if ([string]::IsNullOrWhiteSpace($exe)) {
-
-        Write-DaoLog `
-            "AnyDesk executable not found." `
-            "WARN"
-
-        Set-Content `
-            -LiteralPath $idFile `
-            -Value "Unavailable" `
-            -Encoding UTF8
-
-        return $false
-    }
+    # --------------------------------------------------------
+    # Restart/start TightVNC service
+    # --------------------------------------------------------
 
     try {
 
-        # Start AnyDesk.
-        & $exe --start `
-            >> $anydeskLog `
-            2>&1
+        & $tightVnc -stop -silent 2>&1 |
+            Out-File -FilePath $VncLog -Append
 
-        Start-Sleep -Seconds 5
+    }
+    catch {
+    }
 
-        if (-not [string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
+    Start-Sleep -Seconds 2
 
-            Write-DaoLog `
-                "Configuring AnyDesk unattended access."
+    try {
 
-            $psi = New-Object `
-                System.Diagnostics.ProcessStartInfo
+        & $tightVnc -start -silent 2>&1 |
+            Out-File -FilePath $VncLog -Append
 
-            $psi.FileName = $exe
+    }
+    catch {
+        Write-Log "[WARN] TightVNC start command failed."
+    }
+
+    Start-Sleep -Seconds 3
+
+    if (-not (Test-TcpPort -Port $VncPort)) {
+
+        Write-Log "[WARN] TCP 5900 is not listening."
+
+        try {
+            Get-Service |
+                Where-Object {
+                    $_.Name -match "tvn|tight|vnc"
+                } |
+                Format-Table -AutoSize |
+                Out-String |
+                Add-Content $VncLog
+        }
+        catch {
+        }
+
+    }
+    else {
+
+        Write-Log "[OK] TightVNC TCP 5900 is listening."
+    }
+}
+
+# ============================================================
+# ANYDESK
+# ============================================================
+
+$AnyDeskStatus = "UNAVAILABLE"
+$AnyDeskId = ""
+
+if ($anydesk) {
+
+    Write-Log "Starting/configuring AnyDesk..."
+
+    try {
+
+        # Start installed service.
+        & $anydesk --start 2>&1 |
+            Out-File -FilePath $AnyDeskLog -Append
+
+    }
+    catch {
+    }
+
+    Start-Sleep -Seconds 5
+
+    # --------------------------------------------------------
+    # Configure unattended access.
+    #
+    # Password is passed over STDIN rather than as a command-line
+    # argument, avoiding direct exposure in the process command line.
+    # --------------------------------------------------------
+
+    if (-not [string]::IsNullOrWhiteSpace($AnyDeskPassword)) {
+
+        try {
+
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+
+            $psi.FileName = $anydesk
             $psi.Arguments = "--set-password _unattended_access"
             $psi.UseShellExecute = $false
             $psi.RedirectStandardInput = $true
@@ -785,128 +777,315 @@ function Configure-AnyDesk {
             $psi.RedirectStandardError = $true
             $psi.CreateNoWindow = $true
 
-            $process = New-Object `
-                System.Diagnostics.Process
+            $p = [System.Diagnostics.Process]::new()
+            $p.StartInfo = $psi
 
-            $process.StartInfo = $psi
+            [void]$p.Start()
 
-            [void]$process.Start()
+            $p.StandardInput.WriteLine($AnyDeskPassword)
+            $p.StandardInput.Close()
 
-            # Secret goes to stdin.
-            # It is never written to a log.
-            $process.StandardInput.WriteLine(
-                $env:ANYDESK_PASSWORD
-            )
+            $stdout = $p.StandardOutput.ReadToEnd()
+            $stderr = $p.StandardError.ReadToEnd()
 
-            $process.StandardInput.Close()
+            $p.WaitForExit()
 
-            $null = $process.StandardOutput.ReadToEnd()
-            $null = $process.StandardError.ReadToEnd()
-
-            $process.WaitForExit()
-
-            if ($process.ExitCode -ne 0) {
-
-                Write-DaoLog `
-                    "AnyDesk password configuration returned exit code $($process.ExitCode)." `
-                    "WARN"
+            if ($stdout) {
+                Add-Content -Path $AnyDeskLog -Value $stdout
             }
+
+            if ($stderr) {
+                Add-Content -Path $AnyDeskLog -Value $stderr
+            }
+
+            if ($p.ExitCode -eq 0) {
+                Write-Log "[OK] AnyDesk unattended-access password configured."
+            }
+            else {
+                Write-Log "[WARN] AnyDesk password configuration returned exit code $($p.ExitCode)."
+            }
+
         }
-        else {
+        catch {
 
-            Write-DaoLog `
-                "ANYDESK_PASSWORD is missing; unattended access not configured." `
-                "WARN"
+            Write-Log "[WARN] AnyDesk password configuration failed: $($_.Exception.Message)"
         }
+    }
 
-        $idOutput = & $exe --get-id 2>$null | Out-String
+    # --------------------------------------------------------
+    # Get ID
+    # --------------------------------------------------------
 
-        if ($null -eq $idOutput) {
-            $idOutput = ""
-        }
+    try {
 
-        $id = (
-            $idOutput -split "`r?`n" |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -match "^\d{6,20}$" } |
+        $idOutput = & $anydesk --get-id 2>&1
+
+        $AnyDeskId = (
+            $idOutput |
+            ForEach-Object {
+                "$_"
+            } |
+            Select-String -Pattern "\d{6,}" -AllMatches |
+            ForEach-Object {
+                $_.Matches.Value
+            } |
             Select-Object -First 1
         )
 
-        if ([string]::IsNullOrWhiteSpace($id)) {
-
-            Write-DaoLog `
-                "AnyDesk ID could not be retrieved." `
-                "WARN"
-
-            Set-Content `
-                -LiteralPath $idFile `
-                -Value "Unavailable" `
-                -Encoding UTF8
-
-            return $false
-        }
-
-        Set-Content `
-            -LiteralPath $idFile `
-            -Value $id `
-            -Encoding UTF8
-
-        $status = & $exe --get-status 2>$null | Out-String
-
-        if ($null -eq $status) {
-            $status = ""
-        }
-
-        $status = $status.Trim()
-
-        Add-Content `
-            -LiteralPath $anydeskLog `
-            -Value (
-                "[{0}] AnyDesk status: {1}" -f `
-                (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `
-                $status
-            ) `
-            -Encoding UTF8
-
-        Write-DaoLog "AnyDesk ID: $id"
-        Write-DaoLog "AnyDesk status: $status"
-
-        return $true
     }
     catch {
+    }
 
-        Write-DaoLog `
-            "AnyDesk configuration failed: $($_.Exception.Message)" `
-            "WARN"
+    if ($AnyDeskId) {
+
+        $AnyDeskId = "$AnyDeskId".Trim()
 
         Set-Content `
-            -LiteralPath $idFile `
-            -Value "Unavailable" `
-            -Encoding UTF8
+            -Path $AnyDeskIdFile `
+            -Value $AnyDeskId `
+            -NoNewline
 
-        return $false
+        $AnyDeskStatus = "RUNNING"
+
+        Write-Log "[OK] AnyDesk ID detected."
+
     }
+    else {
+
+        $AnyDeskStatus = "ID NOT DETECTED"
+
+        Write-Log "[WARN] AnyDesk ID could not be detected."
+    }
+
+}
+else {
+
+    Write-Log "[WARN] AnyDesk executable unavailable."
 }
 
+# ============================================================
+# WEBSOCKIFY
+# ============================================================
 
-# ==============================================================
-# CLOUDFLARE URL PARSER
-# ==============================================================
+Write-Log "Starting websockify..."
 
-function Find-CloudflareUrl {
-    param(
-        [string]$StdOutPath,
+if (Test-TcpPort -Port $WebPort) {
 
-        [string]$StdErrPath
+    $owner = Get-PortOwner -Port $WebPort
+
+    Write-Log "TCP 6080 already occupied by: $owner"
+
+    Stop-ProcessesByName @(
+        "websockify"
     )
 
-    $stdout = Read-SafeText -Path $StdOutPath
-    $stderr = Read-SafeText -Path $StdErrPath
+    Start-Sleep -Seconds 2
+}
 
-    # ----------------------------------------------------------
-    # IMPORTANT:
-    # Never allow null to reach Regex.Match().
-    # ----------------------------------------------------------
+$webArgs = @(
+    "--web",
+    $NoVncDir,
+    "127.0.0.1:$WebPort",
+    "127.0.0.1:$VncPort"
+)
+
+try {
+
+    $webProcess = Start-Process `
+        -FilePath $websockify `
+        -ArgumentList $webArgs `
+        -WorkingDirectory $NoVncDir `
+        -RedirectStandardOutput $WebLog `
+        -RedirectStandardError $WebErrorLog `
+        -PassThru `
+        -WindowStyle Hidden
+
+}
+catch {
+
+    throw "Could not start websockify: $($_.Exception.Message)"
+}
+
+if (-not (Wait-ForPort -Port $WebPort -TimeoutSeconds 30)) {
+
+    Write-Log "[ERROR] TCP 6080 did not start."
+
+    if (Test-Path $WebLog) {
+        Write-Host "----- websockify stdout -----"
+        Get-Content $WebLog -Tail 100
+    }
+
+    if (Test-Path $WebErrorLog) {
+        Write-Host "----- websockify stderr -----"
+        Get-Content $WebErrorLog -Tail 100
+    }
+
+    throw "websockify failed to listen on TCP 6080."
+}
+
+Write-Log "[OK] websockify TCP 6080 is listening."
+
+# ============================================================
+# CLOUDFLARED
+# ============================================================
+
+if (-not $cloudflared) {
+    throw "cloudflared executable was not found."
+}
+
+Write-Log "Starting Cloudflare Quick Tunnel..."
+
+# Remove old URLs.
+Remove-Item $TunnelUrlFile -Force -ErrorAction SilentlyContinue
+Remove-Item $NoVncUrlFile -Force -ErrorAction SilentlyContinue
+
+# Kill stale cloudflared.
+Stop-ProcessesByName @("cloudflared")
+
+Start-Sleep -Seconds 2
+
+$cloudProcess = $null
+
+try {
+
+    $cloudProcess = Start-Process `
+        -FilePath $cloudflared `
+        -ArgumentList @(
+            "tunnel",
+            "--no-autoupdate",
+            "--url",
+            "http://127.0.0.1:$WebPort"
+        ) `
+        -RedirectStandardOutput $CloudLog `
+        -RedirectStandardError $CloudErrLog `
+        -PassThru `
+        -WindowStyle Hidden
+
+}
+catch {
+
+    throw "Could not start cloudflared: $($_.Exception.Message)"
+}
+
+# ------------------------------------------------------------
+# URL polling
+# ------------------------------------------------------------
+
+$publicBaseUrl = $null
+$cloudDeadline = (Get-Date).AddSeconds(120)
+
+while ((Get-Date) -lt $cloudDeadline) {
+
+    # --------------------------------------------------------
+    # Process check
+    # --------------------------------------------------------
+
+    if ($cloudProcess.HasExited) {
+
+        Write-Log "[WARN] cloudflared exited unexpectedly with code $($cloudProcess.ExitCode)."
+
+        # Do NOT call Regex.Match() on a null value.
+        $stdoutText = ""
+        $stderrText = ""
+
+        try {
+            if (Test-Path $CloudLog) {
+                $stdoutText = [string](Get-Content -Raw -LiteralPath $CloudLog -ErrorAction SilentlyContinue)
+            }
+        }
+        catch {
+            $stdoutText = ""
+        }
+
+        try {
+            if (Test-Path $CloudErrLog) {
+                $stderrText = [string](Get-Content -Raw -LiteralPath $CloudErrLog -ErrorAction SilentlyContinue)
+            }
+        }
+        catch {
+            $stderrText = ""
+        }
+
+        if ([string]::IsNullOrWhiteSpace($stdoutText)) {
+            $stdoutText = ""
+        }
+
+        if ([string]::IsNullOrWhiteSpace($stderrText)) {
+            $stderrText = ""
+        }
+
+        Write-Host "----- cloudflared stdout -----"
+
+        if ($stdoutText.Length -gt 0) {
+            Write-Host $stdoutText
+        }
+        else {
+            Write-Host "(empty)"
+        }
+
+        Write-Host "----- cloudflared stderr -----"
+
+        if ($stderrText.Length -gt 0) {
+            Write-Host $stderrText
+        }
+        else {
+            Write-Host "(empty)"
+        }
+
+        Write-Host "----- diagnostics -----"
+        Write-Host "Exit code: $($cloudProcess.ExitCode)"
+        Write-Host "TCP 6080: $(Test-TcpPort -Port $WebPort)"
+        Write-Host "cloudflared alive: $(-not $cloudProcess.HasExited)"
+
+        throw "cloudflared exited before a Quick Tunnel URL was detected."
+    }
+
+    # --------------------------------------------------------
+    # Safely read stdout/stderr
+    # --------------------------------------------------------
+
+    $stdout = ""
+    $stderr = ""
+
+    try {
+
+        if (Test-Path $CloudLog) {
+
+            $raw = Get-Content `
+                -Raw `
+                -LiteralPath $CloudLog `
+                -ErrorAction SilentlyContinue
+
+            if ($null -ne $raw) {
+                $stdout = [string]$raw
+            }
+        }
+    }
+    catch {
+        $stdout = ""
+    }
+
+    try {
+
+        if (Test-Path $CloudErrLog) {
+
+            $rawErr = Get-Content `
+                -Raw `
+                -LiteralPath $CloudErrLog `
+                -ErrorAction SilentlyContinue
+
+            if ($null -ne $rawErr) {
+                $stderr = [string]$rawErr
+            }
+        }
+    }
+    catch {
+        $stderr = ""
+    }
+
+    # --------------------------------------------------------
+    # NEVER Regex.Match() with null.
+    # --------------------------------------------------------
 
     if ($null -eq $stdout) {
         $stdout = ""
@@ -916,1099 +1095,504 @@ function Find-CloudflareUrl {
         $stderr = ""
     }
 
-    $combined = [string]::Concat(
-        [string]$stdout,
-        "`r`n",
-        [string]$stderr
-    )
+    $combined = "$stdout`n$stderr"
 
     if ($null -eq $combined) {
         $combined = ""
     }
 
-    try {
+    if (-not [string]::IsNullOrWhiteSpace($combined)) {
 
-        $pattern = "https://[a-zA-Z0-9-]+\.trycloudflare\.com"
+        try {
 
-        $match = [regex]::Match(
-            $combined,
-            $pattern,
-            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-        )
+            $match = [regex]::Match(
+                $combined,
+                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            )
 
-        if (
-            $match.Success -and
-            -not [string]::IsNullOrWhiteSpace($match.Value)
-        ) {
-            return $match.Value.TrimEnd("/")
+            if ($match.Success) {
+
+                $publicBaseUrl = $match.Value.Trim()
+
+                if ($publicBaseUrl) {
+                    break
+                }
+            }
+        }
+        catch {
+
+            Write-Log "Cloudflare URL parsing warning: $($_.Exception.Message)"
         }
     }
-    catch {
 
-        Write-DaoLog `
-            "Cloudflare regex processing failed: $($_.Exception.Message)" `
-            "WARN"
-    }
-
-    return $null
+    Start-Sleep -Seconds 2
 }
 
+# ============================================================
+# CLOUDFLARE FAILURE
+# ============================================================
 
-# ==============================================================
-# CLOUDFLARE
-# ==============================================================
+if ([string]::IsNullOrWhiteSpace($publicBaseUrl)) {
 
-function Start-Cloudflare {
+    Write-Host ""
+    Write-Host "=============================================="
+    Write-Host "CLOUDFLARE QUICK TUNNEL FAILED"
+    Write-Host "=============================================="
 
-    $exe = Find-Executable `
-        -Names @("cloudflared.exe")
+    Write-Host ""
+    Write-Host "TCP 5900 listening: $(Test-TcpPort -Port $VncPort)"
+    Write-Host "TCP 6080 listening: $(Test-TcpPort -Port $WebPort)"
 
-    if ([string]::IsNullOrWhiteSpace($exe)) {
+    if ($cloudProcess) {
 
-        Write-DaoLog `
-            "cloudflared.exe was not found." `
-            "WARN"
+        $alive = $false
 
-        return $null
+        try {
+            $alive = -not $cloudProcess.HasExited
+        }
+        catch {
+        }
+
+        Write-Host "cloudflared process alive: $alive"
+
+        if ($cloudProcess.HasExited) {
+            Write-Host "cloudflared exit code: $($cloudProcess.ExitCode)"
+        }
     }
 
-    if (-not (Test-PortListening -Port $NoVncPort)) {
+    Write-Host ""
+    Write-Host "----- cloudflared stdout -----"
 
-        Write-DaoLog `
-            "Refusing to start Cloudflare because TCP $NoVncPort is not listening." `
-            "ERROR"
+    if (Test-Path $CloudLog) {
 
-        return $null
+        $stdoutFinal = ""
+
+        try {
+            $stdoutFinal = [string](Get-Content -Raw -LiteralPath $CloudLog -ErrorAction SilentlyContinue)
+        }
+        catch {
+            $stdoutFinal = ""
+        }
+
+        if ([string]::IsNullOrWhiteSpace($stdoutFinal)) {
+            Write-Host "(empty)"
+        }
+        else {
+            Write-Host $stdoutFinal
+        }
+    }
+    else {
+        Write-Host "(file not found)"
     }
 
-    Stop-ProcessSafe -Name "cloudflared"
+    Write-Host ""
+    Write-Host "----- cloudflared stderr -----"
 
-    $stdout = Join-Path `
-        $Logs `
-        "cloudflared.log"
+    if (Test-Path $CloudErrLog) {
 
-    $stderr = Join-Path `
-        $Logs `
-        "cloudflared-error.log"
+        $stderrFinal = ""
 
-    $tunnelFile = Join-Path `
-        $Logs `
-        "tunnel-url.txt"
+        try {
+            $stderrFinal = [string](Get-Content -Raw -LiteralPath $CloudErrLog -ErrorAction SilentlyContinue)
+        }
+        catch {
+            $stderrFinal = ""
+        }
 
-    $novncFile = Join-Path `
-        $Logs `
-        "novnc-url.txt"
+        if ([string]::IsNullOrWhiteSpace($stderrFinal)) {
+            Write-Host "(empty)"
+        }
+        else {
+            Write-Host $stderrFinal
+        }
+    }
+    else {
+        Write-Host "(file not found)"
+    }
 
-    Remove-Item `
-        -LiteralPath $tunnelFile `
-        -Force `
-        -ErrorAction SilentlyContinue
+    throw "Cloudflare Quick Tunnel URL was not detected within 120 seconds."
+}
 
-    Remove-Item `
-        -LiteralPath $novncFile `
-        -Force `
-        -ErrorAction SilentlyContinue
+# ============================================================
+# SAVE URL
+# ============================================================
 
-    Write-DaoLog `
-        "Starting Cloudflare Quick Tunnel -> http://127.0.0.1:$NoVncPort"
+$publicUrl = "$publicBaseUrl/vnc.html"
 
-    try {
+Set-Content `
+    -LiteralPath $TunnelUrlFile `
+    -Value $publicBaseUrl `
+    -NoNewline
 
-        $process = Start-LoggedProcess `
-            -FilePath $exe `
-            -Arguments @(
-                "tunnel",
-                "--url",
-                "http://127.0.0.1:$NoVncPort",
-                "--no-autoupdate"
-            ) `
-            -StdOut $stdout `
-            -StdErr $stderr `
-            -WorkingDirectory $Tools
+Set-Content `
+    -LiteralPath $NoVncUrlFile `
+    -Value $publicUrl `
+    -NoNewline
 
-        $deadline = (Get-Date).AddSeconds(120)
+Write-Log "[OK] Cloudflare Quick Tunnel URL detected."
+Write-Log "Base URL: $publicBaseUrl"
+Write-Log "noVNC URL: $publicUrl"
 
-        $url = $null
+# ============================================================
+# FINAL SERVICE VERIFICATION
+# ============================================================
 
-        while ((Get-Date) -lt $deadline) {
+$vncListening = Test-TcpPort -Port $VncPort
+$webListening = Test-TcpPort -Port $WebPort
+
+if (-not $vncListening) {
+    Write-Log "[WARN] TightVNC is not currently listening on TCP 5900."
+}
+
+if (-not $webListening) {
+    throw "noVNC/websockify is no longer listening on TCP 6080."
+}
+
+$cloudAlive = $false
+
+try {
+    $cloudAlive = -not $cloudProcess.HasExited
+}
+catch {
+}
+
+# ============================================================
+# CONNECTION INFO
+# ============================================================
+
+$dashboard = @"
+==============================================
+        DAO WINDOWS DESKTOP
+==============================================
+
+Windows:
+$($os.Caption)
+
+Applications:
+FileZilla: $(if ($filezilla) {"OK"} else {"NOT FOUND"})
+Geany: $(if ($geany) {"OK"} else {"NOT FOUND"})
+AnyDesk: $(if ($anydesk) {"OK"} else {"NOT FOUND"})
+TightVNC: $(if ($tightVnc) {"OK"} else {"NOT FOUND"})
+noVNC: $(if (Test-Path (Join-Path $NoVncDir "vnc.html")) {"OK"} else {"NOT FOUND"})
+Cloudflare Tunnel: $(if ($cloudAlive) {"OK"} else {"NOT RUNNING"})
+
+==============================================
+
+Workspace:
+$Workspace
+
+==============================================
+
+AnyDesk:
+Status: $AnyDeskStatus
+ID: $(if ($AnyDeskId) {$AnyDeskId} else {"NOT DETECTED"})
+
+==============================================
+
+VNC:
+Status: $(if ($vncListening) {"RUNNING"} else {"NOT LISTENING"})
+TCP: $VncPort
+
+noVNC:
+Status: $(if ($webListening) {"RUNNING"} else {"NOT LISTENING"})
+TCP: $WebPort
+
+WEB URL:
+$publicUrl
+
+==============================================
+
+Backup:
+Will be created at workflow shutdown.
+
+Restore:
+Completed by restore.ps1 before desktop startup.
+
+Runtime:
+$RuntimeMinutes minutes active runtime
+240 minutes workflow maximum
+
+==============================================
+
+IMPORTANT:
+Do not display the actual passwords.
+==============================================
+"@
+
+Set-Content `
+    -LiteralPath $Connection `
+    -Value $dashboard
+
+Write-Host ""
+Write-Host $dashboard
+
+# ============================================================
+# KEEP ALIVE / SUPERVISOR
+# ============================================================
+
+Write-Log "DAO desktop is now active."
+
+$startTime = Get-Date
+$endTime = $startTime.AddMinutes($RuntimeMinutes)
+
+$vncRestartCount = 0
+$webRestartCount = 0
+$cloudRestartCount = 0
+$anyDeskRestartCount = 0
+
+while ((Get-Date) -lt $endTime) {
+
+    $elapsed = (Get-Date) - $startTime
+
+    $elapsedText = "{0:00}:{1:00}:{2:00}" -f `
+        [int]$elapsed.TotalHours,
+        $elapsed.Minutes,
+        $elapsed.Seconds
+
+    $total = [TimeSpan]::FromMinutes($RuntimeMinutes)
+
+    $remaining = $endTime - (Get-Date)
+
+    if ($remaining.TotalSeconds -lt 0) {
+        $remaining = [TimeSpan]::Zero
+    }
+
+    $remainingText = "{0:00}:{1:00}:{2:00}" -f `
+        [int]$remaining.TotalHours,
+        $remaining.Minutes,
+        $remaining.Seconds
+
+    Write-Host ""
+    Write-Host "DAO Desktop active"
+    Write-Host "Runtime: $elapsedText / $($total.Hours.ToString('00')):$($total.Minutes.ToString('00')):00"
+    Write-Host "Remaining: $remainingText"
+
+    # --------------------------------------------------------
+    # TightVNC supervisor
+    # --------------------------------------------------------
+
+    if (-not (Test-TcpPort -Port $VncPort)) {
+
+        if ($vncRestartCount -lt 3 -and $tightVnc) {
+
+            $vncRestartCount++
+
+            Write-Log "TightVNC appears down. Restart attempt $vncRestartCount/3."
+
+            try {
+                & $tightVnc -stop -silent 2>&1 |
+                    Out-File -FilePath $VncLog -Append
+            }
+            catch {
+            }
 
             Start-Sleep -Seconds 2
 
-            # --------------------------------------------------
-            # Check process
-            # --------------------------------------------------
-
-            $exited = $false
-
             try {
-                $exited = $process.HasExited
-            }
-            catch {
-                $exited = $true
-            }
-
-            if ($exited) {
-
-                Write-DaoLog `
-                    "cloudflared exited during startup." `
-                    "ERROR"
-
-                try {
-                    Write-DaoLog `
-                        "cloudflared exit code: $($process.ExitCode)" `
-                        "ERROR"
-                }
-                catch {
-                }
-
-                break
-            }
-
-            # --------------------------------------------------
-            # Read BOTH streams safely.
-            # --------------------------------------------------
-
-            $url = Find-CloudflareUrl `
-                -StdOutPath $stdout `
-                -StdErrPath $stderr
-
-            if (-not [string]::IsNullOrWhiteSpace($url)) {
-                break
-            }
-        }
-
-        if ([string]::IsNullOrWhiteSpace($url)) {
-
-            Write-DaoLog `
-                "Cloudflare URL was not detected after 120 seconds." `
-                "ERROR"
-
-            Write-DaoLog `
-                "TCP 6080 listening: $(Test-PortListening -Port $NoVncPort)" `
-                "ERROR"
-
-            $alive = $false
-
-            try {
-                $alive = -not $process.HasExited
+                & $tightVnc -start -silent 2>&1 |
+                    Out-File -FilePath $VncLog -Append
             }
             catch {
             }
 
-            Write-DaoLog `
-                "cloudflared process alive: $alive" `
-                "ERROR"
+            Start-Sleep -Seconds 3
 
-            try {
-                if ($process.HasExited) {
-                    Write-DaoLog `
-                        "cloudflared exit code: $($process.ExitCode)" `
-                        "ERROR"
-                }
-            }
-            catch {
-            }
-
-            $safeStdout = Read-SafeText -Path $stdout
-            $safeStderr = Read-SafeText -Path $stderr
-
-            if ([string]::IsNullOrWhiteSpace($safeStdout)) {
-
-                Write-DaoLog `
-                    "cloudflared stdout is empty." `
-                    "WARN"
-            }
-            else {
-
-                Write-DaoLog `
-                    "cloudflared stdout:`n$safeStdout" `
-                    "ERROR"
-            }
-
-            if ([string]::IsNullOrWhiteSpace($safeStderr)) {
-
-                Write-DaoLog `
-                    "cloudflared stderr is empty." `
-                    "WARN"
-            }
-            else {
-
-                Write-DaoLog `
-                    "cloudflared stderr:`n$safeStderr" `
-                    "ERROR"
-            }
-
-            return $null
-        }
-
-        $url = $url.TrimEnd("/")
-
-        $browserUrl = "$url/vnc.html"
-
-        Set-Content `
-            -LiteralPath $tunnelFile `
-            -Value $url `
-            -Encoding UTF8
-
-        Set-Content `
-            -LiteralPath $novncFile `
-            -Value $browserUrl `
-            -Encoding UTF8
-
-        Write-DaoLog `
-            "Cloudflare URL: $url"
-
-        Write-DaoLog `
-            "noVNC URL: $browserUrl"
-
-        return $process
-    }
-    catch {
-
-        Write-DaoLog `
-            "Cloudflare startup exception: $($_.Exception.Message)" `
-            "ERROR"
-
-        return $null
-    }
-}
-
-
-# ==============================================================
-# WEBSOCKIFY
-# ==============================================================
-
-function Start-Websockify {
-
-    if (-not (Test-PortListening -Port $VncPort)) {
-
-        Write-DaoLog `
-            "Cannot start websockify because VNC TCP $VncPort is not listening." `
-            "ERROR"
-
-        return $null
-    }
-
-    if (-not (Test-Path -LiteralPath (Join-Path $NoVncRoot "vnc.html"))) {
-
-        Write-DaoLog `
-            "Cannot start websockify because noVNC is missing." `
-            "ERROR"
-
-        return $null
-    }
-
-    if (-not $script:PythonExe) {
-
-        Write-DaoLog `
-            "Python executable is unavailable." `
-            "ERROR"
-
-        return $null
-    }
-
-    # ----------------------------------------------------------
-    # Existing listener
-    # ----------------------------------------------------------
-
-    if (Test-PortListening -Port $NoVncPort) {
-
-        $owner = Get-PortOwner -Port $NoVncPort
-
-        if ($null -ne $owner) {
-
-            Write-DaoLog `
-                "TCP $NoVncPort already belongs to PID $($owner.Id) ($($owner.ProcessName))."
-
-            # Do not kill an unknown process.
-            if (
-                $owner.ProcessName -notmatch "^python" -and
-                $owner.ProcessName -ne "websockify"
-            ) {
-
-                Write-DaoLog `
-                    "TCP $NoVncPort is owned by an unexpected process." `
-                    "ERROR"
-
-                return $null
-            }
-
-            # Existing expected process can be reused.
-            return $owner
-        }
-    }
-
-    $stdout = Join-Path `
-        $Logs `
-        "websockify.log"
-
-    $stderr = Join-Path `
-        $Logs `
-        "websockify-error.log"
-
-    Write-DaoLog `
-        "Starting websockify 127.0.0.1:$NoVncPort -> 127.0.0.1:$VncPort."
-
-    try {
-
-        $process = Start-LoggedProcess `
-            -FilePath $script:PythonExe `
-            -Arguments @(
-                "-m",
-                "websockify",
-                "--web=$NoVncRoot",
-                "127.0.0.1:$NoVncPort",
-                "127.0.0.1:$VncPort",
-                "--file-only",
-                "--heartbeat=30"
-            ) `
-            -StdOut $stdout `
-            -StdErr $stderr `
-            -WorkingDirectory $NoVncRoot
-
-        Start-Sleep -Seconds 2
-
-        try {
-            if ($process.HasExited) {
-
-                Write-DaoLog `
-                    "websockify exited immediately with code $($process.ExitCode)." `
-                    "ERROR"
-
-                return $null
-            }
-        }
-        catch {
-        }
-
-        if (-not (Wait-Port -Port $NoVncPort -TimeoutSeconds 30)) {
-
-            Write-DaoLog `
-                "websockify did not open TCP $NoVncPort." `
-                "ERROR"
-
-            $out = Read-SafeText -Path $stdout
-            $err = Read-SafeText -Path $stderr
-
-            if (-not [string]::IsNullOrWhiteSpace($out)) {
-                Write-DaoLog "websockify stdout:`n$out" "ERROR"
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($err)) {
-                Write-DaoLog "websockify stderr:`n$err" "ERROR"
-            }
-
-            return $null
-        }
-
-        Write-DaoLog `
-            "noVNC/websockify is listening on TCP $NoVncPort."
-
-        return $process
-    }
-    catch {
-
-        Write-DaoLog `
-            "websockify startup exception: $($_.Exception.Message)" `
-            "ERROR"
-
-        return $null
-    }
-}
-
-
-# ==============================================================
-# APPLICATION INSTALLATION
-# ==============================================================
-
-function Install-Applications {
-
-    $results = [ordered]@{}
-
-    $results["FileZilla"] = Install-ChocoPackage `
-        -Package "filezilla" `
-        -Detector {
-            Find-Executable `
-                -Names @("filezilla.exe")
-        }
-
-    $results["Geany"] = Install-ChocoPackage `
-        -Package "geany" `
-        -Detector {
-            Find-Executable `
-                -Names @("geany.exe")
-        }
-
-    $results["AnyDesk"] = Install-ChocoPackage `
-        -Package "anydesk" `
-        -Detector {
-            Find-Executable `
-                -Names @("AnyDesk.exe")
-        }
-
-    $results["TightVNC"] = Install-ChocoPackage `
-        -Package "tightvnc" `
-        -Detector {
-            $service = Get-TightVncService
-
-            if ($null -ne $service) {
-                return "tvnserver"
-            }
-
-            return $null
-        }
-
-    $results["Cloudflare"] = Install-ChocoPackage `
-        -Package "cloudflared" `
-        -Detector {
-            Find-Executable `
-                -Names @("cloudflared.exe")
-        }
-
-    return $results
-}
-
-
-# ==============================================================
-# DASHBOARD
-# ==============================================================
-
-function Write-Dashboard {
-
-    param(
-        [hashtable]$Services
-    )
-
-    $idFile = Join-Path $Logs "anydesk-id.txt"
-    $urlFile = Join-Path $Logs "novnc-url.txt"
-    $tunnelFile = Join-Path $Logs "tunnel-url.txt"
-
-    $anydeskId = "Unavailable"
-    $novncUrl = "Unavailable"
-    $tunnelUrl = "Unavailable"
-
-    if (Test-Path -LiteralPath $idFile) {
-        $value = Get-Content `
-            -LiteralPath $idFile `
-            -Raw `
-            -ErrorAction SilentlyContinue
-
-        if ($null -ne $value) {
-            $anydeskId = $value.Trim()
-        }
-    }
-
-    if (Test-Path -LiteralPath $urlFile) {
-        $value = Get-Content `
-            -LiteralPath $urlFile `
-            -Raw `
-            -ErrorAction SilentlyContinue
-
-        if ($null -ne $value) {
-            $novncUrl = $value.Trim()
-        }
-    }
-
-    if (Test-Path -LiteralPath $tunnelFile) {
-        $value = Get-Content `
-            -LiteralPath $tunnelFile `
-            -Raw `
-            -ErrorAction SilentlyContinue
-
-        if ($null -ne $value) {
-            $tunnelUrl = $value.Trim()
-        }
-    }
-
-    $vncStatus = if (
-        Test-PortListening -Port $VncPort
-    ) {
-        "RUNNING"
-    }
-    else {
-        "NOT LISTENING"
-    }
-
-    $novncStatus = if (
-        Test-PortListening -Port $NoVncPort
-    ) {
-        "RUNNING"
-    }
-    else {
-        "NOT LISTENING"
-    }
-
-    $lines = @(
-        "============================================================",
-        "                 DAO WINDOWS DESKTOP",
-        "============================================================",
-        "",
-        "Windows:",
-        "Windows Server 2025 Runner",
-        "",
-        "Applications:",
-        "[{0}] FileZilla" -f $(if ($Services["FileZilla"]) { "OK" } else { "FAIL" }),
-        "[{0}] Geany" -f $(if ($Services["Geany"]) { "OK" } else { "FAIL" }),
-        "[{0}] AnyDesk" -f $(if ($Services["AnyDesk"]) { "OK" } else { "WARN" }),
-        "[{0}] TightVNC" -f $(if ($Services["TightVNC"]) { "OK" } else { "FAIL" }),
-        "[{0}] noVNC" -f $(if ($Services["noVNC"]) { "OK" } else { "FAIL" }),
-        "[{0}] websockify" -f $(if ($Services["websockify"]) { "OK" } else { "FAIL" }),
-        "[{0}] Cloudflare Tunnel" -f $(if ($Services["Cloudflare"]) { "OK" } else { "WARN" }),
-        "",
-        "============================================================",
-        "",
-        "Workspace:",
-        $Workspace,
-        "",
-        "============================================================",
-        "",
-        "AnyDesk:",
-        "Status: $(if ($Services["AnyDesk"]) { "RUNNING" } else { "UNAVAILABLE" })",
-        "ID: $anydeskId",
-        "",
-        "============================================================",
-        "",
-        "VNC:",
-        "Status: $vncStatus",
-        "TCP: $VncPort",
-        "",
-        "noVNC:",
-        "Status: $novncStatus",
-        "TCP: $NoVncPort",
-        "",
-        "WEB URL:",
-        $novncUrl,
-        "",
-        "Tunnel:",
-        $tunnelUrl,
-        "",
-        "============================================================",
-        "",
-        "Backup:",
-        "dao-windows-backup",
-        "",
-        "Restore:",
-        "Latest valid dao-windows-backup artifact",
-        "",
-        "Runtime:",
-        "Approximately 03:40:00 desktop runtime",
-        "04:00:00 total job maximum",
-        "",
-        "============================================================",
-        "",
-        "IMPORTANT:",
-        "Do not display the actual passwords.",
-        "",
-        "============================================================"
-    )
-
-    Set-Content `
-        -LiteralPath (Join-Path $Logs "connection-info.txt") `
-        -Value $lines `
-        -Encoding UTF8
-
-    Write-Host ""
-
-    foreach ($line in $lines) {
-        Write-Host $line
-    }
-
-    Write-Host ""
-}
-
-
-# ==============================================================
-# STARTUP
-# ==============================================================
-
-function Initialize-Desktop {
-
-    Write-DaoLog "Starting DAO Windows Desktop."
-
-    $python = Get-Command `
-        python `
-        -ErrorAction SilentlyContinue
-
-    if ($null -eq $python) {
-
-        Write-DaoLog `
-            "Python is unavailable." `
-            "ERROR"
-
-        return $false
-    }
-
-    $script:PythonExe = $python.Source
-
-    $apps = Install-Applications
-
-    $services = [ordered]@{
-        FileZilla  = [bool]$apps["FileZilla"]
-        Geany      = [bool]$apps["Geany"]
-        AnyDesk    = $false
-        TightVNC   = $false
-        noVNC      = $false
-        websockify = $false
-        Cloudflare = $false
-    }
-
-    # ----------------------------------------------------------
-    # noVNC
-    # ----------------------------------------------------------
-
-    $services["noVNC"] = Install-NoVnc
-
-    # ----------------------------------------------------------
-    # websockify package
-    # ----------------------------------------------------------
-
-    $services["websockify"] = Install-Websockify
-
-    # ----------------------------------------------------------
-    # TightVNC
-    # ----------------------------------------------------------
-
-    if ($apps["TightVNC"]) {
-        $services["TightVNC"] = Start-TightVnc
-    }
-
-    # ----------------------------------------------------------
-    # AnyDesk
-    # ----------------------------------------------------------
-
-    if ($apps["AnyDesk"]) {
-        $services["AnyDesk"] = Configure-AnyDesk
-    }
-
-    # ----------------------------------------------------------
-    # Start websockify ONLY after VNC.
-    # ----------------------------------------------------------
-
-    $script:WebsockifyProcess = $null
-
-    if (
-        $services["TightVNC"] -and
-        $services["noVNC"] -and
-        $services["websockify"]
-    ) {
-
-        $script:WebsockifyProcess = Start-Websockify
-
-        if ($null -ne $script:WebsockifyProcess) {
-            $services["websockify"] = $true
         }
         else {
-            $services["websockify"] = $false
+
+            Write-Log "TightVNC restart limit reached."
         }
     }
 
-    # ----------------------------------------------------------
-    # Cloudflare ONLY after 6080.
-    # ----------------------------------------------------------
+    # --------------------------------------------------------
+    # websockify supervisor
+    # --------------------------------------------------------
 
-    $script:CloudflaredProcess = $null
+    if (-not (Test-TcpPort -Port $WebPort)) {
 
-    if (
-        $services["websockify"] -and
-        (Test-PortListening -Port $NoVncPort)
-    ) {
+        if ($webRestartCount -lt 3) {
 
-        $script:CloudflaredProcess = Start-Cloudflare
+            $webRestartCount++
 
-        if ($null -ne $script:CloudflaredProcess) {
-            $services["Cloudflare"] = $true
-        }
-    }
+            Write-Log "websockify appears down. Restart attempt $webRestartCount/3."
 
-    $script:DaoServices = $services
+            Stop-ProcessesByName @("websockify")
 
-    Write-Dashboard -Services $services
-
-    return $true
-}
-
-
-# ==============================================================
-# SERVICE HEALTH
-# ==============================================================
-
-function Repair-TightVnc {
-
-    if (Test-PortListening -Port $VncPort) {
-        return $true
-    }
-
-    Write-DaoLog `
-        "TightVNC TCP $VncPort is down. Attempting restart." `
-        "WARN"
-
-    return Start-TightVnc
-}
-
-
-function Repair-Websockify {
-
-    if (Test-PortListening -Port $NoVncPort) {
-        return $true
-    }
-
-    if (-not (Test-PortListening -Port $VncPort)) {
-        Write-DaoLog `
-            "Cannot repair websockify because VNC is unavailable." `
-            "WARN"
-
-        return $false
-    }
-
-    Write-DaoLog `
-        "websockify TCP $NoVncPort is down. Attempting restart." `
-        "WARN"
-
-    $newProcess = Start-Websockify
-
-    if ($null -ne $newProcess) {
-
-        $script:WebsockifyProcess = $newProcess
-
-        return $true
-    }
-
-    return $false
-}
-
-
-function Repair-Cloudflare {
-
-    $alive = $false
-
-    if ($null -ne $script:CloudflaredProcess) {
-
-        try {
-            $alive = -not $script:CloudflaredProcess.HasExited
-        }
-        catch {
-            $alive = $false
-        }
-    }
-
-    if ($alive) {
-        return $true
-    }
-
-    if (-not (Test-PortListening -Port $NoVncPort)) {
-
-        Write-DaoLog `
-            "Cloudflare cannot restart because noVNC is unavailable." `
-            "WARN"
-
-        return $false
-    }
-
-    Write-DaoLog `
-        "cloudflared is not running. Attempting restart." `
-        "WARN"
-
-    $newProcess = Start-Cloudflare
-
-    if ($null -ne $newProcess) {
-
-        $script:CloudflaredProcess = $newProcess
-
-        return $true
-    }
-
-    return $false
-}
-
-
-function Repair-AnyDesk {
-
-    $exe = Find-Executable `
-        -Names @("AnyDesk.exe")
-
-    if ($null -eq $exe) {
-        return $false
-    }
-
-    $process = Get-Process `
-        -Name "AnyDesk" `
-        -ErrorAction SilentlyContinue
-
-    if ($null -ne $process) {
-        return $true
-    }
-
-    Write-DaoLog `
-        "AnyDesk process not detected; attempting restart." `
-        "WARN"
-
-    & $exe --start 2>$null | Out-Null
-
-    Start-Sleep -Seconds 3
-
-    $process = Get-Process `
-        -Name "AnyDesk" `
-        -ErrorAction SilentlyContinue
-
-    return ($null -ne $process)
-}
-
-
-# ==============================================================
-# RUNTIME SUPERVISOR
-# ==============================================================
-
-function Run-Supervisor {
-
-    if ($null -eq $script:DaoServices) {
-
-        if (-not (Initialize-Desktop)) {
-
-            Write-DaoLog `
-                "Desktop initialization failed." `
-                "ERROR"
-
-            return
-        }
-    }
-
-    $services = $script:DaoServices
-
-    $runtimeMinutes = 220
-
-    $start = Get-Date
-    $deadline = $start.AddMinutes($runtimeMinutes)
-
-    $vncRepairs = 0
-    $websockifyRepairs = 0
-    $cloudflareRepairs = 0
-    $anydeskRepairs = 0
-
-    $lastDashboard = Get-Date
-    $lastVncCheck = Get-Date
-
-    Write-DaoLog `
-        "Runtime supervisor started."
-
-    Write-DaoLog `
-        "Maximum runtime: $runtimeMinutes minutes."
-
-    while ((Get-Date) -lt $deadline) {
-
-        Start-Sleep -Seconds 30
-
-        # ------------------------------------------------------
-        # VNC
-        # ------------------------------------------------------
-
-        if (-not (Test-PortListening -Port $VncPort)) {
-
-            if ($vncRepairs -lt 3) {
-
-                if (Repair-TightVnc) {
-
-                    $vncRepairs++
-
-                    Write-DaoLog `
-                        "TightVNC repair succeeded."
-                }
-                else {
-
-                    $vncRepairs++
-
-                    Write-DaoLog `
-                        "TightVNC repair failed." `
-                        "WARN"
-                }
-            }
-            else {
-
-                Write-DaoLog `
-                    "TightVNC repair limit reached." `
-                    "ERROR"
-            }
-        }
-
-        # ------------------------------------------------------
-        # WEBSOCKIFY
-        # ------------------------------------------------------
-
-        if (-not (Test-PortListening -Port $NoVncPort)) {
-
-            if ($websockifyRepairs -lt 3) {
-
-                if (Repair-Websockify) {
-
-                    $websockifyRepairs++
-
-                    Write-DaoLog `
-                        "websockify repair succeeded."
-                }
-                else {
-
-                    $websockifyRepairs++
-
-                    Write-DaoLog `
-                        "websockify repair failed." `
-                        "WARN"
-                }
-            }
-            else {
-
-                Write-DaoLog `
-                    "websockify repair limit reached." `
-                    "ERROR"
-            }
-        }
-
-        # ------------------------------------------------------
-        # CLOUDFLARE
-        # ------------------------------------------------------
-
-        $cloudAlive = $false
-
-        if ($null -ne $script:CloudflaredProcess) {
+            Start-Sleep -Seconds 2
 
             try {
-                $cloudAlive = `
-                    -not $script:CloudflaredProcess.HasExited
+
+                $webProcess = Start-Process `
+                    -FilePath $websockify `
+                    -ArgumentList $webArgs `
+                    -WorkingDirectory $NoVncDir `
+                    -RedirectStandardOutput $WebLog `
+                    -RedirectStandardError $WebErrorLog `
+                    -PassThru `
+                    -WindowStyle Hidden
+
             }
             catch {
-                $cloudAlive = $false
+                Write-Log "websockify restart failed."
             }
         }
+        else {
 
-        if (-not $cloudAlive) {
+            Write-Log "websockify restart limit reached."
+        }
+    }
 
-            if ($cloudflareRepairs -lt 3) {
+    # --------------------------------------------------------
+    # Cloudflare supervisor
+    # --------------------------------------------------------
 
-                if (Repair-Cloudflare) {
+    $cloudAliveNow = $false
 
-                    $cloudflareRepairs++
+    try {
+        $cloudAliveNow = -not $cloudProcess.HasExited
+    }
+    catch {
+        $cloudAliveNow = $false
+    }
 
-                    $services["Cloudflare"] = $true
+    if (-not $cloudAliveNow) {
 
-                    Write-DaoLog `
-                        "Cloudflare repair succeeded."
+        if ($cloudRestartCount -lt 2) {
+
+            $cloudRestartCount++
+
+            Write-Log "cloudflared appears down. Restart attempt $cloudRestartCount/2."
+
+            Stop-ProcessesByName @("cloudflared")
+
+            Start-Sleep -Seconds 2
+
+            try {
+
+                $cloudProcess = Start-Process `
+                    -FilePath $cloudflared `
+                    -ArgumentList @(
+                        "tunnel",
+                        "--no-autoupdate",
+                        "--url",
+                        "http://127.0.0.1:$WebPort"
+                    ) `
+                    -RedirectStandardOutput $CloudLog `
+                    -RedirectStandardError $CloudErrLog `
+                    -PassThru `
+                    -WindowStyle Hidden
+
+            }
+            catch {
+
+                Write-Log "cloudflared restart failed."
+            }
+
+        }
+        else {
+
+            Write-Log "cloudflared restart limit reached."
+        }
+    }
+
+    # --------------------------------------------------------
+    # AnyDesk supervisor
+    # --------------------------------------------------------
+
+    if ($anydesk) {
+
+        try {
+
+            $anydeskProcesses = Get-Process `
+                -Name "AnyDesk" `
+                -ErrorAction SilentlyContinue
+
+            if (-not $anydeskProcesses) {
+
+                if ($anyDeskRestartCount -lt 2) {
+
+                    $anyDeskRestartCount++
+
+                    Write-Log "AnyDesk process not detected. Restart attempt $anyDeskRestartCount/2."
+
+                    try {
+                        & $anydesk --start 2>&1 |
+                            Out-File -FilePath $AnyDeskLog -Append
+                    }
+                    catch {
+                    }
                 }
-                else {
-
-                    $cloudflareRepairs++
-
-                    $services["Cloudflare"] = $false
-
-                    Write-DaoLog `
-                        "Cloudflare repair failed." `
-                        "WARN"
-                }
             }
-            else {
 
-                $services["Cloudflare"] = $false
-
-                Write-DaoLog `
-                    "Cloudflare repair limit reached." `
-                    "ERROR"
-            }
         }
-
-        # ------------------------------------------------------
-        # ANYDESK
-        # ------------------------------------------------------
-
-        if (-not (Repair-AnyDesk)) {
-
-            if ($anydeskRepairs -lt 3) {
-
-                $anydeskRepairs++
-
-                Write-DaoLog `
-                    "AnyDesk is unavailable." `
-                    "WARN"
-            }
+        catch {
         }
-
-        # ------------------------------------------------------
-        # DASHBOARD EVERY 5 MINUTES
-        # ------------------------------------------------------
-
-        if (
-            ((Get-Date) - $lastDashboard).TotalMinutes -ge 5
-        ) {
-
-            Write-Dashboard `
-                -Services $services
-
-            $lastDashboard = Get-Date
-        }
-
-        # ------------------------------------------------------
-        # RUNTIME
-        # ------------------------------------------------------
-
-        $elapsed = (Get-Date) - $start
-        $remaining = $deadline - (Get-Date)
-
-        if ($remaining.TotalSeconds -lt 0) {
-            $remaining = [TimeSpan]::Zero
-        }
-
-        Write-Host (
-            "DAO Desktop active | Runtime: {0:hh\:mm\:ss} / {1:hh\:mm\:ss} | Remaining: {2:hh\:mm\:ss}" -f `
-            $elapsed,
-            ([TimeSpan]::FromMinutes($runtimeMinutes)),
-            $remaining
-        )
     }
 
-    Write-DaoLog `
-        "DAO Desktop runtime limit reached."
+    # --------------------------------------------------------
+    # Update connection info
+    # --------------------------------------------------------
 
-    Write-Dashboard `
-        -Services $services
+    $vncNow = Test-TcpPort -Port $VncPort
+    $webNow = Test-TcpPort -Port $WebPort
+
+    $status = @"
+==============================================
+        DAO WINDOWS DESKTOP
+==============================================
+
+Workspace:
+$Workspace
+
+AnyDesk:
+Status: $AnyDeskStatus
+ID: $(if ($AnyDeskId) {$AnyDeskId} else {"NOT DETECTED"})
+
+VNC:
+Status: $(if ($vncNow) {"RUNNING"} else {"DOWN"})
+TCP: 5900
+
+noVNC:
+Status: $(if ($webNow) {"RUNNING"} else {"DOWN"})
+TCP: 6080
+
+WEB URL:
+$publicUrl
+
+Runtime:
+$elapsedText / $($total.Hours.ToString('00')):$($total.Minutes.ToString('00')):00
+
+Remaining:
+$remainingText
+
+==============================================
+"@
+
+    try {
+        Set-Content -LiteralPath $Connection -Value $status
+    }
+    catch {
+    }
+
+    Start-Sleep -Seconds 30
 }
 
+# ============================================================
+# SHUTDOWN
+# ============================================================
 
-# ==============================================================
-# MAIN
-# ==============================================================
+Write-Log "Runtime limit reached."
+Write-Log "Stopping remote-access services before backup."
 
-try {
+# Stop Cloudflare.
+Stop-ProcessesByName @(
+    "cloudflared"
+)
 
-    if (-not [string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-        Write-Output "::add-mask::$env:VNC_PASSWORD"
-    }
+# Stop websockify.
+Stop-ProcessesByName @(
+    "websockify"
+)
 
-    if (-not [string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
-        Write-Output "::add-mask::$env:ANYDESK_PASSWORD"
-    }
-
-    if ($RuntimeOnly) {
-
-        Run-Supervisor
-
-        exit 0
-    }
-
-    if (-not (Initialize-Desktop)) {
-
-        Write-DaoLog `
-            "Initialization completed with critical failures." `
-            "ERROR"
-
-        exit 1
-    }
-
-    Write-DaoLog `
-        "Initial DAO Desktop setup completed."
-
-    exit 0
-}
-catch {
-
-    Write-DaoLog `
-        "Fatal desktop script error: $($_.Exception.Message)" `
-        "ERROR"
-
-    exit 1
-}
+Write-Log "Remote-access processes stopped."
+Write-Log "desktop.ps1 completed normally."
